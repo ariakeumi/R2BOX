@@ -2,7 +2,7 @@ import SwiftUI
 import R2BOXCore
 
 /// 侧栏：一个连接就是一个储存桶，直接平铺。
-/// - 连接设置了储存桶 → 行主文本为桶名，副文本为连接名
+/// - 连接设置了储存桶 → 行主文本为连接名，副文本为实际桶名
 /// - 未设置储存桶 → 行主文本为连接名；若该连接处于激活状态且含多个桶，
 ///   其桶以普通行追加展示（保持可浏览性）
 struct SidebarView: View {
@@ -30,22 +30,20 @@ struct SidebarView: View {
             }
         }
         .listStyle(.sidebar)
-        .safeAreaInset(edge: .bottom) {
-            HStack {
+        // 不让位：列表直接从标题条下开始（Section 头"储存桶"贴近交通灯）
+        .safeAreaInset(edge: .top, spacing: 0) {
+            Color.clear.frame(height: 0)
+        }
+        .toolbar {
+            ToolbarItem(placement: .automatic) {
                 Button {
                     state.editingConnection = nil
                     state.showConnectionSheet = true
                 } label: {
-                    Image(systemName: "plus.circle.fill")
-                        .font(.system(size: 20))
-                        .foregroundStyle(Color.accentColor)
+                    Image(systemName: "plus")
                 }
-                .buttonStyle(.plain)
                 .help("新建连接")
-                Spacer()
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
         }
     }
 
@@ -115,3 +113,4 @@ struct SidebarView: View {
         }
     }
 }
+

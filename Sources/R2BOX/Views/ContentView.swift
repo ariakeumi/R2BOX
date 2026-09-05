@@ -6,8 +6,9 @@ struct ContentView: View {
     @Environment(AppState.self) private var state
 
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: .constant(.all)) {
             SidebarView()
+                .toolbar(removing: .sidebarToggle)
                 .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 340)
         } detail: {
             BrowserView()

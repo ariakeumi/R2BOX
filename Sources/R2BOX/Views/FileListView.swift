@@ -8,6 +8,14 @@ struct BreadcrumbView: View {
     @Environment(AppState.self) private var state
 
     var body: some View {
+        if state.prefix.isEmpty {
+            EmptyView()   // 根目录：无文件夹层级，不显示面包屑条
+        } else {
+            breadcrumbBar
+        }
+    }
+
+    private var breadcrumbBar: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 4) {
                 ForEach(Array(state.breadcrumbParts.enumerated()), id: \.offset) { index, part in

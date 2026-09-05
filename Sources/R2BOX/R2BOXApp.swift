@@ -9,6 +9,7 @@ struct R2BOXApp: App {
 
     init() {
         KeyHandler.shared.install()
+        ToolbarTuner.install()
         if CommandLine.arguments.contains("--selftest") {
             SelfTest.run()
         }
@@ -44,6 +45,9 @@ struct AppCommands: Commands {
     private var state: AppState { SharedState.app }
 
     var body: some Commands {
+        // 移除 WindowGroup 默认的"新建窗口 ⌘N"
+        CommandGroup(replacing: .newItem) { }
+
         CommandGroup(after: .newItem) {
             Button("新建连接…") {
                 state.editingConnection = nil
