@@ -188,8 +188,11 @@ public actor MockDataStore {
     }
 
     @discardableResult
-    func put(bucket: String, key: String, data: Data) -> String {
+    func put(bucket: String, key: String, data: Data, ifMatch: String?) throws -> String {
         seedIfNeeded(bucket)
+        if let ifMatch, buckets[bucket]?[key]?.etag != ifMatch {
+            throw S3Error.preconditionFailed
+        }
         let etag = Self.makeEtag()
         buckets[bucket, default: [:]][key] = Entry(data: data, etag: etag, lastModified: Date())
         return etag

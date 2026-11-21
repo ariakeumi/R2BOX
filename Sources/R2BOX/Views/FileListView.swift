@@ -2,317 +2,264 @@ import SwiftUI
 import R2BOXCore
 import R2BOXSync
 
-// MARK: - 面包屑
-
-struct BreadcrumbView: View {
-    @Environment(AppState.self) private var state
-
-    var body: some View {
-        if state.prefix.isEmpty {
-            EmptyView()   // 根目录：无文件夹层级，不显示面包屑条
-        } else {
-            breadcrumbBar
-        }
-    }
-
-    private var breadcrumbBar: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 4) {
-                ForEach(Array(state.breadcrumbParts.enumerated()), id: \.offset) { index, part in
-                    if index > 0 {
-                        Image(systemName: "chevron.compact.right")
-                            .font(.footnote)
-                            .foregroundStyle(.tertiary)
-                    }
-                    Button {
-                        state.enterFolder(part.prefix)
-                    } label: {
-                        Text(part.name.isEmpty ? "/" : part.name)
-                            .font(.callout)
-                            .fontWeight(index == state.breadcrumbParts.count - 1 ? .semibold : .regular)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(index == state.breadcrumbParts.count - 1 ? Color.primary : Color.secondary)
-                }
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-        }
-        .background(.bar)
-    }
-}
-
-// MARK: - 文件列表
-
 struct FileListView: View {
     @Environment(AppState.self) private var state
+    @State private var sortOrder = [KeyPathComparator(\Row.name, comparator: .localizedStandard)]
+    @FocusState private var tableFocused: Bool
+    let upload: () -> Void
 
-    /// 目录行（文件夹 / 对象统一行模型）
-    struct Row: Identifiable, Hashable {
-        let id: String          // "dir:<prefix>" 或 "obj:<key>"
-        let displayName: String
-        let isFolder: Bool
-        let entry: ObjectEntry? // 文件夹为 nil
+    private struct Row: Identifiable {
+        let id: String
+        let name: String
+        let key: String
+        let entry: ObjectEntry?
 
-        static func folder(_ prefix: String) -> Row {
-            let trimmed = String(prefix.dropLast(prefix.hasSuffix("/") ? 1 : 0))
-            let name = trimmed.components(separatedBy: "/").last ?? trimmed
-            return Row(id: "dir:" + prefix, displayName: name, isFolder: true, entry: nil)
+        var isFolder: Bool { entry == nil }
+        var size: Int64 { entry?.size ?? 0 }
+        var modified: Date { entry?.lastModified ?? .distantPast }
+
+        init(folder prefix: String) {
+            id = "dir:" + prefix
+            key = prefix
+            name = String(prefix.dropLast()).components(separatedBy: "/").last ?? prefix
+            entry = nil
         }
 
-        static func object(_ entry: ObjectEntry) -> Row {
-            Row(id: "obj:" + entry.key, displayName: entry.fileName, isFolder: false, entry: entry)
+        init(object: ObjectEntry) {
+            id = "obj:" + object.key
+            key = object.key
+            name = object.fileName
+            entry = object
         }
 
-        var key: String {
-            isFolder ? String(id.dropFirst(4)) : (entry?.key ?? "")
+        var actionEntry: ObjectEntry {
+            entry ?? ObjectEntry(key: key, size: 0, lastModified: Date(), etag: "")
         }
-    }
-
-    private var rows: [Row] {
-        var list = state.folders.map { Row.folder($0) }
-        list += state.objects.map { Row.object($0) }
-        return list
     }
 
     var body: some View {
-        Group {
-            if rows.isEmpty {
-                emptyState
-            } else {
-                table
+        if state.folders.isEmpty && state.objects.isEmpty {
+            ContentUnavailableView {
+                Label("空文件夹", systemImage: "folder")
+            } description: {
+                Text("将文件拖到此处，或从 Mac 选择要上传的文件。")
+            } actions: {
+                Button("上传文件…", action: upload)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            table
         }
-        .onChange(of: state.objects) { _, _ in keepSelectionValid() }
-        .onAppear { KeyHandler.shared.install() }
-    }
-
-    private var emptyState: some View {
-        ContentUnavailableView {
-            Label("空文件夹", systemImage: "tray")
-        } description: {
-            Text("把文件拖到这里上传，或使用工具栏的上传按钮")
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var table: some View {
-        let data = rows
-        let selectionBinding = Binding(
-            get: { state.selectedRowID.map { Set([$0]) } ?? Set<String>() },
-            set: { newValue in
-                state.setRowSelection(newValue.first)
+        let rows = state.folders.map(Row.init(folder:)).sorted(using: sortOrder)
+                 + state.objects.map(Row.init(object:)).sorted(using: sortOrder)
+        let selection = Binding(get: { state.selectedRowID }, set: { state.setRowSelection($0) })
+
+        return Table(rows, selection: selection, sortOrder: $sortOrder) {
+            TableColumn("名称", value: \.name, comparator: .localizedStandard) { row in
+                Label {
+                    Text(row.name)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                } icon: {
+                    Image(systemName: Formatting.icon(forFileName: row.name, isFolder: row.isFolder))
+                        .foregroundStyle(row.isFolder ? Color.accentColor : .secondary)
+                }
+                .help(row.name)
             }
-        )
-        return Table(of: Row.self, selection: selectionBinding, sortOrder: Binding.constant([KeyPathComparator<Row>(\.displayName)])) {
-            TableColumn("名称") { row in nameCell(row) }
-            TableColumn("大小") { row in sizeCell(row) }
-            TableColumn("修改时间") { row in modifiedCell(row) }
-            TableColumn("状态") { row in statusCell(row) }
-        } rows: {
-            ForEach(data) { row in
-                TableRow(row)
-                    .contextMenu { rowMenu(row) }
+            .width(min: 150, ideal: 340)
+
+            TableColumn("大小", value: \.size) { row in
+                if !row.isFolder {
+                    Text(Formatting.fileSize(row.size))
+                        .monospacedDigit()
+                }
+            }
+            .width(min: 66, ideal: 84, max: 132)
+            .alignment(.trailing)
+
+            TableColumn("修改时间", value: \.modified) { row in
+                if !row.isFolder {
+                    Text(row.modified, format: .dateTime.year().month().day().hour().minute())
+                        .monospacedDigit()
+                        .lineLimit(1)
+                        .help(Formatting.absoluteTime(row.modified))
+                }
+            }
+            .width(min: 116, ideal: 168, max: 220)
+
+            TableColumn("同步状态") { row in
+                if let entry = row.entry, let bucket = state.selectedBucket {
+                    statusLabel(state.statusPublic(bucket: bucket, key: entry.key))
+                }
+            }
+            .width(min: 88, ideal: 112, max: 170)
+        }
+        .tableStyle(.inset)
+        .alternatingRowBackgrounds()
+        .focused($tableFocused)
+        .task {
+            if state.focusFileTableOnLoad {
+                tableFocused = true
+                state.focusFileTableOnLoad = false
             }
         }
-        // 键盘兜底（列表聚焦时生效；主通道是 KeyHandler 窗口级监听）
-        .onKeyPress(.return) { state.activateSelectedRow(); return .handled }
-        .onKeyPress(.space) { state.quickLookSelectedRow(); return .handled }
-    }
-
-
-
-    // MARK: 单元格
-
-    private func nameCell(_ row: Row) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: icon(for: row))
-                .foregroundStyle(row.isFolder ? Color.accentColor : Color.secondary)
-                .font(.body)
-            Text(row.displayName)
-                .fontWeight(row.isFolder ? .medium : .regular)
-            syncBadge(for: row)
-        }
-    }
-
-    private func sizeCell(_ row: Row) -> some View {
-        Group {
-            if let entry = row.entry {
-                Text(Formatting.fileSize(entry.size))
-            } else {
-                Text("--")
+        .contextMenu(forSelectionType: Row.ID.self) { items in
+            if let row = rows.first(where: { items.contains($0.id) }) {
+                rowMenu(row)
+            }
+        } primaryAction: { items in
+            if let row = rows.first(where: { items.contains($0.id) }) {
+                activate(row)
             }
         }
-        .foregroundStyle(.secondary)
-        .monospacedDigit()
-    }
-
-    private func modifiedCell(_ row: Row) -> some View {
-        Group {
-            if let entry = row.entry {
-                Text(Formatting.relativeTime(entry.lastModified))
-            } else {
-                Text("")
-            }
+        .onKeyPress(.return) {
+            guard state.selectedRowID != nil else { return .ignored }
+            state.activateSelectedRow()
+            return .handled
         }
-        .foregroundStyle(.secondary)
-        .monospacedDigit()
-    }
-
-    private func statusCell(_ row: Row) -> some View {
-        Text(statusText(for: row))
-            .foregroundStyle(.secondary)
-    }
-
-    // MARK: 行为
-
-    private func keepSelectionValid() {
-        guard let id = state.selectedRowID else { return }
-        if id.hasPrefix("obj:") {
-            let key = String(id.dropFirst(4))
-            if !state.objects.contains(where: { $0.key == key }) {
-                state.setRowSelection(nil)
-            }
-        } else if !state.listRowIDs.contains(id) {
-            state.setRowSelection(nil)
+        .onKeyPress(.space) {
+            guard state.selection != nil else { return .ignored }
+            state.quickLookSelectedRow()
+            return .handled
         }
     }
 
     private func activate(_ row: Row) {
-        if row.isFolder {
-            state.enterFolder(row.key)
-        } else if let entry = row.entry {
+        if let entry = row.entry {
             Task { await state.openInEditor(entry) }
+        } else {
+            state.enterFolder(row.key)
         }
     }
 
     @ViewBuilder private func rowMenu(_ row: Row) -> some View {
-        if row.isFolder {
-            Button("打开") { activate(row) }
-            Divider()
-            Button("重命名…") {
-                state.renameTarget = ObjectEntry(key: row.key, size: 0, lastModified: Date(), etag: "")
-            }
-            Button("删除…", role: .destructive) {
-                state.deleteTargets = [ObjectEntry(key: row.key, size: 0, lastModified: Date(), etag: "")]
-            }
-        } else if let entry = row.entry {
-            Button("在默认编辑器中打开") {
-                Task { await state.openInEditor(entry) }
-            }
+        if let entry = row.entry {
+            Button("在默认编辑器中打开") { activate(row) }
             Button("Quick Look 预览") { state.quickLook(entry) }
             Divider()
-            Button("立即同步") {
-                Task { await state.syncNowEntry(entry) }
-            }
-            Divider()
-            Button("重命名…") { state.renameTarget = entry }
-            Button("删除…", role: .destructive) { state.deleteTargets = [entry] }
+            Button("立即同步") { Task { await state.syncNowEntry(entry) } }
+        } else {
+            Button("打开") { activate(row) }
+        }
+        Divider()
+        Button("重命名…") { state.renameTarget = row.actionEntry }
+        Button("删除…", role: .destructive) { state.deleteTargets = [row.actionEntry] }
+    }
+
+    @ViewBuilder private func statusLabel(_ status: FileSyncStatus) -> some View {
+        switch status {
+        case .synced:
+            statusLabel("已同步", symbol: "checkmark.circle", color: .green)
+        case .dirty:
+            statusLabel("未同步", symbol: "circle.dotted", color: .orange)
+        case .uploading:
+            statusLabel("上传中", symbol: "arrow.up.circle", color: .blue)
+        case .failed(let reason):
+            statusLabel("同步失败", symbol: "exclamationmark.triangle", color: .red)
+                .help(reason)
+        case .conflict:
+            statusLabel("冲突", symbol: "exclamationmark.circle", color: .orange)
+        case .remoteOnly:
+            EmptyView()
         }
     }
 
-    // MARK: 显示辅助
-
-    private func icon(for row: Row) -> String {
-        if row.isFolder { return "folder.fill" }
-        return Formatting.icon(forFileName: row.displayName, isFolder: false)
-    }
-
-    @ViewBuilder private func syncBadge(for row: Row) -> some View {
-        if !row.isFolder, let bucket = state.selectedBucket, let entry = row.entry {
-            switch state.statusPublic(bucket: bucket, key: entry.key) {
-            case .synced:
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-                    .help("已同步")
-            case .dirty:
-                Image(systemName: "circle.dotted")
-                    .foregroundStyle(.orange)
-                    .help("本地有未同步修改")
-            case .uploading:
-                Image(systemName: "arrow.triangle.2.circlepath")
-                    .foregroundStyle(.blue)
-                    .help("上传中")
-            case .failed:
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.red)
-                    .help("同步失败")
-            case .conflict:
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.orange)
-                    .help("存在冲突，等待处理")
-            case .remoteOnly:
-                EmptyView()
-            }
-        }
-    }
-
-    private func statusText(for row: Row) -> String {
-        guard !row.isFolder, let bucket = state.selectedBucket, let entry = row.entry else { return "" }
-        switch state.statusPublic(bucket: bucket, key: entry.key) {
-        case .synced: return "✓ 已同步"
-        case .dirty: return "未同步"
-        case .uploading: return "上传中…"
-        case .failed: return "失败"
-        case .conflict: return "冲突"
-        case .remoteOnly: return ""
+    private func statusLabel(_ title: LocalizedStringKey, symbol: String, color: Color) -> some View {
+        Label {
+            Text(title)
+        } icon: {
+            Image(systemName: symbol)
+                .foregroundStyle(color)
         }
     }
 }
 
-// MARK: - 状态栏
-
-struct StatusBarView: View {
+struct BrowserStatusBar: View {
     @Environment(AppState.self) private var state
 
-    private var activeTransfers: [AppState.TransferItem] {
-        state.transfers.filter { $0.state == .active }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if !state.prefix.isEmpty {
+                breadcrumbs
+                Divider()
+            }
+
+            HStack(spacing: 8) {
+                activity
+                Spacer(minLength: 0)
+                Text("\(state.folders.count) 个文件夹，\(state.objects.count) 个文件")
+                    .monospacedDigit()
+                    .fixedSize()
+            }
+            .lineLimit(1)
+            .padding(.horizontal, 14)
+            .frame(minHeight: 28)
+        }
+        .font(.footnote)
+        .foregroundStyle(.secondary)
+        .background(.bar)
     }
 
-    var body: some View {
-        HStack(spacing: 12) {
-            if state.outage {
-                Label("网络中断 — 本地修改已保留，恢复后自动续传", systemImage: "wifi.slash")
-                    .foregroundStyle(.red)
-            } else if let item = activeTransfers.first {
+    private var breadcrumbs: some View {
+        let parts = state.breadcrumbParts
+        return ScrollViewReader { proxy in
+            ScrollView(.horizontal) {
                 HStack(spacing: 6) {
-                    Image(systemName: item.kind == .upload ? "arrow.up.circle" : "arrow.down.circle")
-                        .foregroundStyle(.blue)
-                    Text(item.kind == .upload ? "上传" : "下载")
-                    Text(item.name)
-                        .fontWeight(.medium)
-                    ProgressView(value: item.fraction)
-                        .frame(width: 110)
-                    Text("\(Int(item.fraction * 100))%")
-                        .monospacedDigit()
-                        .foregroundStyle(.secondary)
+                    ForEach(parts, id: \.prefix) { part in
+                        if !part.prefix.isEmpty {
+                            Image(systemName: "chevron.right")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                                .accessibilityHidden(true)
+                        }
+                        if part.prefix == state.prefix {
+                            Text(part.name)
+                                .fontWeight(.medium)
+                                .foregroundStyle(.primary)
+                        } else {
+                            Button {
+                                state.enterFolder(part.prefix)
+                            } label: {
+                                Label(part.name, systemImage: part.prefix.isEmpty ? "archivebox" : "folder")
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                    Color.clear.frame(width: 0).id("path-end")
                 }
-            } else if let saved = state.lastSavedKey {
-                let name = saved.components(separatedBy: "/").last ?? saved
-                Label("✓ \(name) 已同步", systemImage: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
+                .fixedSize(horizontal: true, vertical: false)
+                .padding(.horizontal, 14)
+                .frame(minHeight: 28)
             }
-
-            Spacer()
-
-            Text("\(state.folders.count) 个文件夹，\(state.objects.count) 个文件")
-                .foregroundStyle(.secondary)
-                .monospacedDigit()
-
-            Divider()
-                .frame(height: 12)
-
-            HStack(spacing: 4) {
-                Image(systemName: "folder")
-                    .foregroundStyle(.secondary)
-                Text("工作区 ~/Library/Application Support/R2BOX/workspace")
-                    .foregroundStyle(.secondary)
-            }
+            .scrollIndicators(.hidden)
+            .frame(height: 28)
+            .onChange(of: state.prefix, initial: true) { proxy.scrollTo("path-end", anchor: .trailing) }
+            .accessibilityLabel("当前路径")
         }
-        .font(.callout)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 6)
-        .background(.bar)
+    }
+
+    @ViewBuilder private var activity: some View {
+        if state.outage {
+            Label("网络已断开，恢复后继续同步", systemImage: "wifi.slash")
+                .foregroundStyle(.orange)
+        } else if let item = state.transfers.first(where: { $0.state == .active }) {
+            Label(item.name, systemImage: item.kind == .upload ? "arrow.up.circle" : "arrow.down.circle")
+                .truncationMode(.middle)
+                .help(item.name)
+            ProgressView(value: item.fraction)
+                .controlSize(.small)
+                .frame(width: 72)
+                .accessibilityLabel(item.kind == .upload ? "上传进度" : "下载进度")
+        } else if state.directoryBusy {
+            ProgressView()
+                .controlSize(.mini)
+            Text("正在刷新…")
+        } else if let key = state.lastSavedKey {
+            Label("已同步 \((key as NSString).lastPathComponent)", systemImage: "checkmark.circle")
+                .truncationMode(.middle)
+        }
     }
 }

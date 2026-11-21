@@ -21,19 +21,20 @@ public enum OpenDecision {
         syncedMtime: Date?,
         syncedSize: Int64?,
         localMtime: Date?,
-        localSize: Int64?
+        localSize: Int64?,
+        localDirty: Bool = false
     ) -> OpenPlan {
         guard localExists, let base = trackedBaseETag else { return .downloadRemote }
-
-        // 本地 0 字节而远程非空：历史上空文件窗口 bug / 污染残留的特征，
-        // 无论跟踪记录如何都重新下载，避免把陈旧空副本当"最新"打开
-        if localSize == 0 && remoteSize > 0 { return .downloadRemote }
+        if localDirty { return base == currentETag ? .useLocal : .useLocalExpectConflict }
 
         let fingerprintMatch: Bool? = {
             guard let sm = syncedMtime, let ss = syncedSize,
                   let lm = localMtime, let ls = localSize else { return nil }
             return sm == lm && ss == ls
         }()
+
+        // 兼容历史空缓存，同时保留有明确修改痕迹的清空操作。
+        if localSize == 0 && remoteSize > 0 && fingerprintMatch != false { return .downloadRemote }
 
         if base == currentETag {
             // 远程自上次同步后未变：本地是权威副本（本地未上传的修改交给 FSEvents 上传）

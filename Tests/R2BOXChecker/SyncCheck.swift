@@ -10,6 +10,17 @@ enum SyncCheck {
         await runTest("冲突 → 覆盖远程") { try await testConflictOverwrite() }
         await runTest("冲突 → 重新加载远程") { try await testConflictReload() }
         await runTest("冲突 → 保留本地") { try await testConflictKeepLocal() }
+        await runTest("立即同步沿用原基线，双方修改仍触发冲突") { try await testManualSyncConflict() }
+        await runTest("确认覆盖后若远端再次变化，重新询问") { try await testOverwriteRequiresCurrentVersion() }
+        await runTest("连续保存：第二次防抖早于第一次上传完成") {
+            try await testSaveDuringUpload(waitForDebounce: true)
+        }
+        await runTest("连续保存：第二次防抖晚于第一次上传完成") {
+            try await testSaveDuringUpload(waitForDebounce: false)
+        }
+        await runTest("冲突后 HEAD 断网会重试，继续使用原基线") { try await testConflictHeadRetry() }
+        await runTest("同步时远端对象已删除，保留本地并退出冲突态") { try await testRemoteDeletion() }
+        await runTest("重新加载期间写入的新修改得到保留") { try await testSaveDuringReload() }
         await runTest("断网保留修改，恢复后续传") { try await testOutageRetry() }
         await runTest("下载后跟踪记录 baseETag") { try await testTrackAfterDownload() }
         await runTest("下载原子性：空文件窗口不触发上传（回归）") { try await testDownloadAtomicity() }
@@ -17,9 +28,11 @@ enum SyncCheck {
         await runTest("打开决策：一致 / 仅本地改 → 打开本地") { testOpenPlanUseLocal() }
         await runTest("打开决策：本地干净但远程已更新 → 重新下载") { testOpenPlanRemoteChanged() }
         await runTest("打开决策：0 字节残留 + 远程非空 → 重新下载（回归）") { testOpenPlanStaleEmpty() }
+        await runTest("打开文件：保留用户清空后尚未同步的内容") { try await testOpenDirtyEmpty() }
         await runTest("打开决策：双方修改 → 打开本地待冲突") { testOpenPlanExpectConflict() }
         await runTest("打开决策：指纹未知 + 远程已变 → 打开本地待冲突（绝不覆盖，回归）") { testOpenPlanUnknownFingerprint() }
         await runTest("重启恢复：指纹随 tracked.json 持久化") { try await testFingerprintPersistence() }
+        await runTest("同名桶和对象按连接隔离，旧缓存得到保留") { try await testConnectionIsolation() }
     }
 
     // MARK: 工具
@@ -40,6 +53,64 @@ enum SyncCheck {
         private var fired = false
         func fire() { lock.lock(); fired = true; lock.unlock() }
         var isFired: Bool { lock.lock(); defer { lock.unlock() }; return fired }
+    }
+
+    private actor PausingService: S3Service {
+        nonisolated let serviceName = "Pausing test service"
+        let mock = MockS3Service(data: MockDataStore())
+        var sources: [String] = []
+        private var pauseNextUpload = false
+        private var pauseNextDownload = false
+        private var gate: CheckedContinuation<Void, Never>?
+        private var headError: S3Error?
+
+        func holdUpload() { pauseNextUpload = true }
+        func holdDownload() { pauseNextDownload = true }
+        func failNextHead() { headError = .network }
+        var paused: Bool { gate != nil }
+
+        func resume() {
+            gate?.resume()
+            gate = nil
+        }
+
+        func listBuckets() async throws -> [BucketInfo] { try await mock.listBuckets() }
+        func listObjects(bucket: String, prefix: String) async throws -> (folders: [String], objects: [ObjectEntry]) {
+            try await mock.listObjects(bucket: bucket, prefix: prefix)
+        }
+        func headObject(bucket: String, key: String) async throws -> ObjectEntry? {
+            if let headError {
+                self.headError = nil
+                throw headError
+            }
+            return try await mock.headObject(bucket: bucket, key: key)
+        }
+        func download(bucket: String, key: String, destination: URL, progress: ProgressHandler?) async throws -> String {
+            if pauseNextDownload {
+                pauseNextDownload = false
+                await withCheckedContinuation { gate = $0 }
+            }
+            return try await mock.download(bucket: bucket, key: key, destination: destination, progress: progress)
+        }
+        func upload(
+            bucket: String, key: String, source: URL, ifMatch: String?, progress: ProgressHandler?
+        ) async throws -> String {
+            if pauseNextUpload {
+                pauseNextUpload = false
+                await withCheckedContinuation { gate = $0 }
+            }
+            sources.append(try String(contentsOf: source, encoding: .utf8))
+            return try await mock.upload(bucket: bucket, key: key, source: source, ifMatch: ifMatch, progress: progress)
+        }
+        func delete(bucket: String, key: String, isFolder: Bool) async throws {
+            try await mock.delete(bucket: bucket, key: key, isFolder: isFolder)
+        }
+        func move(bucket: String, key: String, isFolder: Bool, newKeyName: String) async throws {
+            try await mock.move(bucket: bucket, key: key, isFolder: isFolder, newKeyName: newKeyName)
+        }
+        func createFolder(bucket: String, prefix: String) async throws {
+            try await mock.createFolder(bucket: bucket, prefix: prefix)
+        }
     }
 
     private static func makeWatchedEngine(
@@ -180,6 +251,170 @@ enum SyncCheck {
             if case .failed = status { return true }
             return false
         }(), "状态为失败/待处理（实际 \(status)）")
+    }
+
+    private static let editedFile = TrackedFile(bucket: "app-config", key: "config.yaml")
+
+    private static func downloadAndTrack(
+        _ file: TrackedFile, workspace: Workspace, engine: SyncEngine
+    ) async throws -> (local: URL, etag: String) {
+        let url = workspace.localURL(bucket: file.bucket, key: file.key)
+        let etag = try await engine.service.download(bucket: file.bucket, key: file.key, destination: url, progress: nil)
+        await engine.track(bucket: file.bucket, key: file.key, baseETag: etag)
+        return (url, etag)
+    }
+
+    private static func testManualSyncConflict() async throws {
+        let (workspace, _) = makeEnv()
+        defer { cleanup(workspace) }
+        let service = MockS3Service(data: MockDataStore())
+        let file = editedFile
+        let engine = SyncEngine(workspace: workspace, service: service)
+        let (url, etag) = try await downloadAndTrack(file, workspace: workspace, engine: engine)
+        let prompted = EventWaiter()
+        engine.conflictHandler = { _, base, remote in
+            if base == etag && base != remote.etag { prompted.fire() }
+            return .keepLocalOnly
+        }
+        _ = try await service.simulateRemoteModify(bucket: file.bucket, key: file.key)
+        let remote = try await service.headObject(bucket: file.bucket, key: file.key)
+        try "manual local edit".write(to: url, atomically: true, encoding: .utf8)
+        await engine.forceUpload(bucket: file.bucket, key: file.key)
+        expectTrue(prompted.isFired, "向冲突处理器传递原基线和最新远端版本")
+        expectEqual(try await service.headObject(bucket: file.bucket, key: file.key)?.etag, remote?.etag, "保留远端修改")
+        expectEqual(await engine.trackedInfo(bucket: file.bucket, key: file.key)?.baseETag, etag, "保留本地版本基线")
+    }
+
+    private static func testOverwriteRequiresCurrentVersion() async throws {
+        let (workspace, _) = makeEnv()
+        defer { cleanup(workspace) }
+        let service = MockS3Service(data: MockDataStore())
+        let file = editedFile
+        let engine = SyncEngine(workspace: workspace, service: service)
+        let (url, _) = try await downloadAndTrack(file, workspace: workspace, engine: engine)
+        _ = try await service.simulateRemoteModify(bucket: file.bucket, key: file.key)
+        guard let initial = try await service.headObject(bucket: file.bucket, key: file.key) else {
+            expectTrue(false, "远端对象存在")
+            return
+        }
+        let promptedAgain = EventWaiter()
+        engine.conflictHandler = { _, _, remote in
+            if remote.etag == initial.etag {
+                _ = try? await service.simulateRemoteModify(bucket: file.bucket, key: file.key)
+                return .overwriteRemote
+            }
+            promptedAgain.fire()
+            return .keepLocalOnly
+        }
+        try "local override".write(to: url, atomically: true, encoding: .utf8)
+        await engine.forceUpload(bucket: file.bucket, key: file.key)
+        expectTrue(promptedAgain.isFired, "变化后的 ETag 需要新的确认")
+        expectEqual(await engine.status(bucket: file.bucket, key: file.key), .failed("已保留本地副本（未上传）"), "第二次选择生效")
+    }
+
+    private static func testSaveDuringUpload(waitForDebounce: Bool) async throws {
+        let (workspace, _) = makeEnv()
+        defer { cleanup(workspace) }
+        let service = PausingService()
+        let file = editedFile
+        let engine = SyncEngine(workspace: workspace, service: service)
+        let (url, _) = try await downloadAndTrack(file, workspace: workspace, engine: engine)
+        await service.holdUpload()
+        let path = "\(file.bucket)/\(file.key)"
+        try "first edit".write(to: url, atomically: true, encoding: .utf8)
+        await engine.handleWorkspaceChanges([path])
+        let paused = await waitUntil { await service.paused }
+        expectTrue(paused, "第一次上传等待提交")
+        guard paused else { return }
+
+        try "second edit, still pending".write(to: url, atomically: true, encoding: .utf8)
+        await engine.handleWorkspaceChanges([path])
+        if waitForDebounce { try await Task.sleep(for: .milliseconds(800)) }
+        await service.resume()
+
+        expectTrue(await waitUntil {
+            let status = await engine.status(bucket: file.bucket, key: file.key)
+            return status == .synced
+        }, "最终显示已同步")
+        expectEqual(await service.sources, ["first edit", "second edit, still pending"], "先上传原快照，再补传新保存")
+        let remoteURL = workspace.baseURL.appendingPathComponent("readback")
+        _ = try await service.download(bucket: file.bucket, key: file.key, destination: remoteURL, progress: nil)
+        expectEqual(try String(contentsOf: remoteURL, encoding: .utf8), "second edit, still pending", "远端收到第二版内容")
+    }
+
+    private static func testConflictHeadRetry() async throws {
+        let (workspace, _) = makeEnv()
+        defer { cleanup(workspace) }
+        let service = PausingService()
+        let file = editedFile
+        let engine = SyncEngine(workspace: workspace, service: service, retryDelay: .seconds(1))
+        let (url, original) = try await downloadAndTrack(file, workspace: workspace, engine: engine)
+        _ = try await service.mock.simulateRemoteModify(bucket: file.bucket, key: file.key)
+        try "conflicting edit".write(to: url, atomically: true, encoding: .utf8)
+        await service.failNextHead()
+        let prompted = EventWaiter()
+        engine.conflictHandler = { _, base, _ in
+            if base == original { prompted.fire() }
+            return .keepLocalOnly
+        }
+        await engine.forceUpload(bucket: file.bucket, key: file.key)
+        let status = await engine.status(bucket: file.bucket, key: file.key)
+        if case .failed(let reason) = status {
+            expectTrue(reason.contains("网络") && !reason.contains("不存在"), "显示真实的网络问题")
+        } else {
+            expectTrue(false, "网络问题结束冲突查询并进入失败状态")
+        }
+        expectEqual(await engine.failedFiles(), [file], "重新进入重试队列")
+        expectTrue(await waitUntil {
+            let status = await engine.status(bucket: file.bucket, key: file.key)
+            return prompted.isFired && status == .failed("已保留本地副本（未上传）")
+        }, "网络恢复后重新询问并处理原冲突")
+        expectEqual(await engine.hasOutage, false, "成功查询后清除断网状态")
+        expectEqual(try String(contentsOf: url, encoding: .utf8), "conflicting edit", "本地内容得到保留")
+    }
+
+    private static func testRemoteDeletion() async throws {
+        let (workspace, _) = makeEnv()
+        defer { cleanup(workspace) }
+        let service = MockS3Service(data: MockDataStore())
+        let file = editedFile
+        let engine = SyncEngine(workspace: workspace, service: service)
+        let (url, _) = try await downloadAndTrack(file, workspace: workspace, engine: engine)
+        try await service.delete(bucket: file.bucket, key: file.key, isFolder: false)
+        try "retain this edit".write(to: url, atomically: true, encoding: .utf8)
+        await engine.forceUpload(bucket: file.bucket, key: file.key)
+        expectEqual(await engine.status(bucket: file.bucket, key: file.key), .failed("远程对象已不存在，本地修改已保留"), "明确提示远端对象不存在")
+        expectTrue(await engine.failedFiles().isEmpty, "已确认的删除不反复重试")
+        expectNil(try await service.headObject(bucket: file.bucket, key: file.key), "不自动重新创建对象")
+        expectEqual(try String(contentsOf: url, encoding: .utf8), "retain this edit", "保留本地内容")
+    }
+
+    private static func testSaveDuringReload() async throws {
+        let (workspace, _) = makeEnv()
+        defer { cleanup(workspace) }
+        let service = PausingService()
+        let file = editedFile
+        let engine = SyncEngine(workspace: workspace, service: service)
+        let (url, original) = try await downloadAndTrack(file, workspace: workspace, engine: engine)
+        _ = try await service.mock.simulateRemoteModify(bucket: file.bucket, key: file.key)
+        await service.holdDownload()
+        let reload = Task { try await engine.reloadFromRemote(bucket: file.bucket, key: file.key) }
+        let paused = await waitUntil { await service.paused }
+        expectTrue(paused, "重新加载等待下载完成")
+        guard paused else {
+            reload.cancel()
+            return
+        }
+        try "fresh save during download".write(to: url, atomically: true, encoding: .utf8)
+        await service.resume()
+        do {
+            _ = try await reload.value
+            expectTrue(false, "新保存应阻止本地替换")
+        } catch {
+            expectTrue(error.localizedDescription.contains("已保留本地修改"), "重新加载报告保留本地修改")
+        }
+        expectEqual(try String(contentsOf: url, encoding: .utf8), "fresh save during download", "保留新的本地修改")
+        expectEqual(await engine.trackedInfo(bucket: file.bucket, key: file.key)?.baseETag, original, "旧基线得到保留")
     }
 
     private static func testOutageRetry() async throws {
@@ -361,6 +596,33 @@ extension SyncCheck {
         )
     }
 
+    private static func testOpenDirtyEmpty() async throws {
+        let (workspace, _) = makeEnv()
+        defer { cleanup(workspace) }
+        let service = MockS3Service(data: MockDataStore())
+        let file = editedFile
+        let engine = SyncEngine(workspace: workspace, service: service)
+        let (url, _) = try await downloadAndTrack(file, workspace: workspace, engine: engine)
+        try Data().write(to: url, options: .atomic)
+        guard let same = try await service.headObject(bucket: file.bucket, key: file.key) else {
+            expectTrue(false, "远端对象存在")
+            return
+        }
+        let first = try await engine.prepareLocalCopy(bucket: file.bucket, entry: same, progress: nil)
+        expectEqual(first?.downloaded, false, "远端未修改时打开空白本地文件")
+
+        _ = try await service.simulateRemoteModify(bucket: file.bucket, key: file.key)
+        guard let changed = try await service.headObject(bucket: file.bucket, key: file.key) else {
+            expectTrue(false, "远端对象存在")
+            return
+        }
+        let restarted = SyncEngine(workspace: workspace, service: service)
+        let second = try await restarted.prepareLocalCopy(bucket: file.bucket, entry: changed, progress: nil)
+        expectEqual(second?.downloaded, false, "重启后远端已修改时仍保留空白本地文件")
+        expectTrue(try Data(contentsOf: url).isEmpty, "未同步的清空操作得到保留")
+        expectEqual(await restarted.status(bucket: file.bucket, key: file.key), .dirty, "重启后仍识别为本地修改")
+    }
+
     /// 远程已更新且本地也有未上传修改（指纹不符）→ 打开本地，保留旧基线，保存时触发冲突
     static func testOpenPlanExpectConflict() {
         expectEqual(
@@ -408,5 +670,41 @@ extension SyncCheck {
         let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
         let size = (attrs[.size] as? NSNumber)?.int64Value
         expectEqual(info?.syncedSize, size, "指纹 size 与本地文件一致")
+    }
+
+    private static func testConnectionIsolation() async throws {
+        let (root, _) = makeEnv()
+        defer { cleanup(root) }
+        let file = editedFile
+        let service = MockS3Service(data: MockDataStore())
+        let legacy = SyncEngine(workspace: root, service: service)
+        let (oldURL, etag) = try await downloadAndTrack(file, workspace: root, engine: legacy)
+        try "unsynced legacy edit".write(to: oldURL, atomically: true, encoding: .utf8)
+        let connection = Connection(
+            name: "A", endpoint: "https://a.example", region: "auto", accessKeyID: "A", pathStyle: true
+        )
+        var secondConnection = connection
+        secondConnection.id = UUID()
+        let workspaceA = root.forConnection(connection)
+        let workspaceB = root.forConnection(secondConnection)
+        expectTrue(workspaceA.baseURL != workspaceB.baseURL, "不同连接的缓存目录不同")
+        expectEqual(root.forConnection(connection).baseURL, workspaceA.baseURL, "重连仍使用原工作区")
+        var movedConnection = connection
+        movedConnection.endpoint = "https://b.example"
+        expectTrue(root.forConnection(movedConnection).baseURL != workspaceA.baseURL, "改变连接端点时切换工作区")
+
+        let engineA = SyncEngine(workspace: workspaceA, service: service)
+        let (urlA, _) = try await downloadAndTrack(file, workspace: workspaceA, engine: engineA)
+        let engineB = SyncEngine(workspace: workspaceB, service: service)
+        await engineB.restoreFromDisk()
+        expectEqual(await engineB.isTracked(bucket: file.bucket, key: file.key), false, "不继承 A 或旧工作区的基线")
+
+        let (urlB, baseB) = try await downloadAndTrack(file, workspace: workspaceB, engine: engineB)
+        expectEqual(baseB, etag, "模拟两个连接的远端 ETag 相同")
+        try "edit in A".write(to: urlA, atomically: true, encoding: .utf8)
+        await engineB.forceUpload(bucket: file.bucket, key: file.key)
+        expectTrue(try String(contentsOf: urlB, encoding: .utf8) != "edit in A", "B 的本地缓存不受影响")
+        expectEqual(try await service.headObject(bucket: file.bucket, key: file.key)?.etag, baseB, "B 不会上传 A 的内容")
+        expectEqual(try String(contentsOf: oldURL, encoding: .utf8), "unsynced legacy edit", "未迁移的旧副本原地保留")
     }
 }

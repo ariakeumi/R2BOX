@@ -1,6 +1,5 @@
 import SwiftUI
 import R2BOXCore
-import R2BOXSync
 
 // MARK: - 连接表单（新建 / 编辑）
 
@@ -14,30 +13,39 @@ struct ConnectionSheet: View {
     @State private var secretKey = ""
     @State private var pathStyle = true
     @State private var bucket = ""
+    @FocusState private var nameFocused: Bool
 
     private var editing: Connection? { appState.editingConnection }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 0) {
             Text(editing == nil ? "新建连接" : "编辑连接")
-                .font(.headline)
+                .font(.title3.weight(.semibold))
+                .padding(.horizontal, 24)
+                .padding(.top, 22)
 
             Form {
-                TextField("名称", text: $name)
-                    .textFieldStyle(.roundedBorder)
-                TextField("Endpoint", text: $endpoint)
-                    .textFieldStyle(.roundedBorder)
-                TextField("Region", text: $region)
-                    .textFieldStyle(.roundedBorder)
-                TextField("Access Key ID", text: $accessKey)
-                    .textFieldStyle(.roundedBorder)
-                SecureField("Secret Access Key", text: $secretKey)
-                    .textFieldStyle(.roundedBorder)
-                TextField("储存桶", text: $bucket)
-                    .textFieldStyle(.roundedBorder)
-                Toggle("Path-Style 寻址", isOn: $pathStyle)
+                Section("储存桶") {
+                    TextField("名称", text: $name, prompt: Text("例如：团队文件"))
+                        .focused($nameFocused)
+                    TextField("Endpoint", text: $endpoint, prompt: Text("https://…"))
+                    TextField("Region", text: $region)
+                    TextField("储存桶名称", text: $bucket, prompt: Text("留空以列出所有储存桶"))
+                    Toggle("Path-Style 寻址", isOn: $pathStyle)
+                }
+                Section("访问凭据") {
+                    TextField("Access Key ID", text: $accessKey)
+                    SecureField(
+                        "Secret Access Key",
+                        text: $secretKey,
+                        prompt: editing == nil ? nil : Text("留空以保留现有密钥")
+                    )
+                }
             }
             .formStyle(.grouped)
+            .defaultFocus($nameFocused, true)
+
+            Divider()
 
             HStack {
                 Spacer()
@@ -50,9 +58,10 @@ struct ConnectionSheet: View {
                 .keyboardShortcut(.defaultAction)
                 .disabled(!valid)
             }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 14)
         }
-        .padding(18)
-        .frame(width: 480)
+        .frame(width: 500, height: 460)
         .onAppear { populate() }
     }
 
@@ -99,7 +108,7 @@ struct ConnectionSheet: View {
             )
             ConnectionManager.shared.add(conn, secretKey: secretKey)
         }
-        if let selected = ConnectionManager.shared.selected {
+        if let selected = ConnectionManager.shared.selected, editing == nil || editing?.id == selected.id {
             appState.connect(to: selected)
         }
     }
@@ -111,35 +120,34 @@ struct RenameSheet: View {
     @Environment(AppState.self) private var state
     @Environment(\.dismiss) private var dismiss
     @State private var newName = ""
+    @FocusState private var nameFocused: Bool
+    let entry: ObjectEntry
+
+    private var originalName: String { (entry.key as NSString).lastPathComponent }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("重命名").font(.headline)
+            Text("重命名").font(.title3.weight(.semibold))
             TextField("新名称", text: $newName)
                 .textFieldStyle(.roundedBorder)
-                .onAppear {
-                    newName = state.renameTarget.map {
-                        ($0.key as NSString).lastPathComponent
-                    } ?? ""
-                }
+                .focused($nameFocused)
             HStack {
                 Spacer()
                 Button("取消") { dismiss() }
                     .keyboardShortcut(.cancelAction)
-                Button("确定") {
-                    if let entry = state.renameTarget {
-                        let name = newName
-                        state.renameTarget = nil
-                        Task { await state.rename(entry, newName: name) }
-                    }
+                Button("重命名") {
+                    let name = newName
                     dismiss()
+                    Task { await state.rename(entry, newName: name) }
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(newName.isEmpty || newName == state.renameTarget.map { ($0.key as NSString).lastPathComponent })
+                .disabled(newName.isEmpty || newName == originalName)
             }
         }
-        .padding(18)
+        .padding(20)
         .frame(width: 380)
+        .defaultFocus($nameFocused, true)
+        .onAppear { newName = originalName }
     }
 }
 
@@ -149,50 +157,51 @@ struct NewFolderSheet: View {
     @Environment(AppState.self) private var state
     @Environment(\.dismiss) private var dismiss
     @State private var folderName = ""
+    @FocusState private var nameFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("新建文件夹").font(.headline)
+            Text("新建文件夹").font(.title3.weight(.semibold))
             TextField("文件夹名称", text: $folderName)
                 .textFieldStyle(.roundedBorder)
+                .focused($nameFocused)
             HStack {
                 Spacer()
                 Button("取消") { dismiss() }
                     .keyboardShortcut(.cancelAction)
                 Button("创建") {
                     let name = folderName
-                    state.folderTarget = nil
-                    Task { await state.createFolder(name) }
                     dismiss()
+                    Task { await state.createFolder(name) }
                 }
                 .keyboardShortcut(.defaultAction)
                 .disabled(folderName.isEmpty)
             }
         }
-        .padding(18)
+        .padding(20)
         .frame(width: 380)
+        .defaultFocus($nameFocused, true)
     }
 }
 
 // MARK: - 设置
 
 struct SettingsView: View {
+    @Environment(AppState.self) private var state
+    @Environment(\.openURL) private var openURL
+
     var body: some View {
         Form {
             Section("工作区") {
-                LabeledContent("本地缓存目录") {
-                    Text("~/Library/Application Support/R2BOX/workspace")
+                LabeledContent {
+                    Button("在 Finder 中显示") { openURL(state.workspaceRoot.baseURL) }
+                } label: {
+                    Text("本地缓存目录")
+                    Text(state.workspaceRoot.baseURL.path(percentEncoded: false))
                         .textSelection(.enabled)
-                        .foregroundStyle(.secondary)
                 }
-            }
-            Section("说明") {
-                Text("Endpoint 含 \"demo.\" 的连接使用内置 Mock 数据；其余 Endpoint 走真实 S3/R2（SigV4 签名 + 流式传输），Access Key 与 Secret 从 Keychain 读取。")
-                    .foregroundStyle(.secondary)
-                    .font(.callout)
             }
         }
         .formStyle(.grouped)
-        .padding(12)
     }
 }

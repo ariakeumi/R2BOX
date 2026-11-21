@@ -95,40 +95,20 @@ final class AppState: Observable {
     var objects: [ObjectEntry] = []
     var selection: ObjectEntry?
     var directoryBusy = false
+    @ObservationIgnored var focusFileTableOnLoad = false
 
-    // 键盘导航（Finder 式，KeyHandler 驱动）
-    /// 文件列表当前选中行（"dir:<prefix>" / "obj:<key>"，与 FileListView.Row.id 一致）
+    /// 文件表格当前选中行（"dir:<prefix>" / "obj:<key>"）。
     var selectedRowID: String?
 
-    /// 文件列表行 ID（与 FileListView 渲染顺序一致：文件夹在前、文件在后）
-    var listRowIDs: [String] {
-        folders.map { "dir:" + $0 } + objects.map { "obj:" + $0.key }
-    }
-
-    /// 有弹层（表单/冲突/确认/错误提示）时键盘导航不接管
-    var keyboardBlocked: Bool {
-        conflictDialog != nil || showConnectionSheet || renameTarget != nil ||
-            folderTarget != nil || !deleteTargets.isEmpty || errorMessage != nil
-    }
-
-    /// ↑↓ 移动选中行（越界钳制；无选中时从头/尾开始）
-    func moveSelection(_ delta: Int) {
-        let ids = listRowIDs
-        guard !ids.isEmpty else { return }
-        guard let current = selectedRowID, let index = ids.firstIndex(of: current) else {
-            setRowSelection(delta >= 0 ? ids.first : ids.last)
-            return
-        }
-        let next = max(0, min(ids.count - 1, index + delta))
-        setRowSelection(ids[next])
-    }
-
     func setRowSelection(_ id: String?) {
-        selectedRowID = id
-        if let id, id.hasPrefix("obj:") {
-            let key = String(id.dropFirst(4))
-            selection = objects.first { $0.key == key }
+        if let id, id.hasPrefix("dir:") {
+            selectedRowID = folders.contains(String(id.dropFirst(4))) ? id : nil
+            selection = nil
+        } else if let id, let object = objects.first(where: { "obj:" + $0.key == id }) {
+            selectedRowID = id
+            selection = object
         } else {
+            selectedRowID = nil
             selection = nil
         }
     }
@@ -159,7 +139,7 @@ final class AppState: Observable {
     var syncStates: [String: FileSyncStatus] = [:]
 
     // 弹窗
-    var conflictDialog: ConflictContext?
+    private(set) var conflictDialog: ConflictContext?
     var showConnectionSheet = false
     var editingConnection: Connection?
     var newConnectionName = ""
@@ -173,14 +153,26 @@ final class AppState: Observable {
     var renameTarget: ObjectEntry?
     var deleteTargets: [ObjectEntry] = []
 
+    func presentConnectionSheet(editing connection: Connection? = nil) {
+        editingConnection = connection
+        showConnectionSheet = true
+    }
+
     // 依赖
-    let workspace: Workspace
+    let workspaceRoot: Workspace
+    private(set) var workspace: Workspace
     let watcher = WatcherHandle()
     var engine: SyncEngine?
     var service: S3Service?
+    @ObservationIgnored private var navigationTask: Task<Void, Never>?
+    @ObservationIgnored private var refreshRequestID: UUID?
+    @ObservationIgnored private var syncEngines: [URL: SyncEngine] = [:]
+    @ObservationIgnored private var pendingConflicts: [PendingConflict] = []
+    @ObservationIgnored private var dismissingConflict = false
 
     /// 正常启动用全局工作区；selftest 传临时工作区避免污染真实数据
     init(workspace: Workspace = Workspace()) {
+        self.workspaceRoot = workspace
         self.workspace = workspace
     }
 
@@ -188,6 +180,11 @@ final class AppState: Observable {
         let id = UUID()
         let file: TrackedFile
         let remote: ObjectEntry
+    }
+
+    private struct PendingConflict {
+        let context: ConflictContext
+        let continuation: CheckedContinuation<ConflictChoice, Never>
     }
 
     struct TransferItem: Identifiable, Equatable {
@@ -207,41 +204,81 @@ final class AppState: Observable {
 
     // MARK: 生命周期
 
-    func connect(to connection: Connection) {
+    func connect(to connection: Connection, focusFileTable: Bool = false, persistSelection: Bool = true) {
         NSLog("[R2BOX] connect: \(connection.name) bucket=\(connection.bucket)")
-        ConnectionManager.shared.selectedID = connection.id
+        if persistSelection { ConnectionManager.shared.selectedID = connection.id }
         self.connection = connection
-        let service = S3ServiceFactory.service(for: connection)
-        self.service = service
-        let engine = SyncEngine(workspace: workspace, service: service)
-        engine.eventHandler = { [weak self] event in
-            Task { @MainActor in self?.handle(event) }
+        buckets = []
+        let pinned = connection.bucket.trimmingCharacters(in: .whitespaces)
+        selectedBucket = pinned.isEmpty ? nil : pinned
+        let scopedWorkspace = workspaceRoot.forConnection(connection)
+        let scope = scopedWorkspace.baseURL
+        if workspace.baseURL != scope {
+            watcher.stop()
+            dismissPendingConflicts()
+            syncStates = [:]
+            transfers = []
+            outage = false
         }
-        engine.conflictHandler = { [weak self] file, _, remote in
-            guard let self else { return .keepLocalOnly }
-            return await self.askConflict(file: file, remote: remote)
+        workspace = scopedWorkspace
+        let engine: SyncEngine
+        if let existing = syncEngines[scope] {
+            engine = existing
+        } else {
+            let service = S3ServiceFactory.service(for: connection)
+            engine = SyncEngine(workspace: scopedWorkspace, service: service)
+            engine.eventHandler = { [weak self] event in
+                Task { @MainActor in
+                    guard let self, self.workspace.baseURL == scope else { return }
+                    self.handle(event)
+                }
+            }
+            engine.conflictHandler = { [weak self] file, _, remote in
+                guard let self else { return .keepLocalOnly }
+                return await self.askConflict(file: file, remote: remote, scope: scope)
+            }
+            syncEngines[scope] = engine
         }
         self.engine = engine
+        let service = engine.service
+        self.service = service
 
-        // FSEvents 监听
-        watcher.start(workspace: workspace) { [engine] paths in
-            Task { await engine.handleWorkspaceChanges(paths) }
-        }
-
-        Task { await engine.restoreFromDisk() }
-        Task { await engine.startNetworkMonitoring() }
-        // 恢复上次会话的同步状态镜像
         Task {
+            await engine.restoreFromDisk()
             let statuses = await engine.allStatuses()
-            for (fileID, status) in statuses {
+            let hasOutage = await engine.hasOutage
+            guard self.engine === engine else { return }
+            for (fileID, status) in statuses where syncStates[fileID] == nil {
                 syncStates[fileID] = status
             }
+            outage = hasOutage
+            watcher.start(workspace: scopedWorkspace) { paths in
+                Task { await engine.handleWorkspaceChanges(paths) }
+            }
+            await engine.startNetworkMonitoring()
         }
-        Task { await loadBuckets() }
+        beginNavigation(to: "", focusFileTable: focusFileTable) {
+            await self.loadBuckets(using: service)
+        }
     }
 
     func shutdown() {
         watcher.stop()
+        dismissPendingConflicts()
+        navigationTask?.cancel()
+        navigationTask = nil
+        connection = nil
+        service = nil
+        engine = nil
+        workspace = workspaceRoot
+        syncStates = [:]
+        transfers = []
+        outage = false
+        buckets = []
+        selectedBucket = nil
+        resetDirectory(to: "")
+        focusFileTableOnLoad = false
+        phase = .idle
     }
 
     private func handle(_ event: SyncEvent) {
@@ -264,13 +301,9 @@ final class AppState: Observable {
             syncStates["\(file.bucket)/\(file.key)"] = .failed(reason)
             upsertTransfer(file: file, kind: .upload, fraction: 1, state: .failed)
             scheduleTransferCleanup(id: "\(file.bucket)/\(file.key)")
-        case .conflictDetected(let file, _, let remote):
+        case .conflictDetected(let file, _, _):
             syncStates["\(file.bucket)/\(file.key)"] = .conflict
             upsertTransfer(file: file, kind: .upload, fraction: 1, state: .conflict)
-            // 同一文件的重复冲突事件不重复弹窗
-            if conflictDialog?.file.key != file.key {
-                conflictDialog = ConflictContext(file: file, remote: remote)
-            }
         case .outageChanged(let on):
             outage = on
         }
@@ -287,86 +320,105 @@ final class AppState: Observable {
         await engine.forceUpload(bucket: bucket, key: entry.key)
     }
 
-    /// 冲突弹窗（模态等待用户选择）
-    private func askConflict(file: TrackedFile, remote: ObjectEntry) async -> ConflictChoice {
-        conflictDialog = ConflictContext(file: file, remote: remote)
+    private func askConflict(file: TrackedFile, remote: ObjectEntry, scope: URL) async -> ConflictChoice {
+        guard workspace.baseURL == scope else { return .keepLocalOnly }
         return await withCheckedContinuation { continuation in
-            self.pendingConflictResumption = continuation
+            let context = ConflictContext(file: file, remote: remote)
+            pendingConflicts.append(PendingConflict(context: context, continuation: continuation))
+            presentNextConflict()
         }
     }
 
-    private var pendingConflictResumption: CheckedContinuation<ConflictChoice, Never>?
+    func presentNextConflict() {
+        guard conflictDialog == nil, !dismissingConflict, !showConnectionSheet else { return }
+        conflictDialog = pendingConflicts.first?.context
+    }
 
-    func resolveConflict(_ choice: ConflictChoice) {
+    func resolveConflict(_ choice: ConflictChoice, id: UUID) {
+        guard conflictDialog?.id == id, pendingConflicts.first?.context.id == id else { return }
+        let pending = pendingConflicts.removeFirst()
+        dismissingConflict = true
         conflictDialog = nil
-        pendingConflictResumption?.resume(returning: choice)
-        pendingConflictResumption = nil
+        pending.continuation.resume(returning: choice)
+    }
+
+    func conflictDialogDidDismiss() {
+        if let id = conflictDialog?.id { resolveConflict(.keepLocalOnly, id: id) }
+        dismissingConflict = false
+        presentNextConflict()
+    }
+
+    private func dismissPendingConflicts() {
+        if conflictDialog != nil { dismissingConflict = true }
+        conflictDialog = nil
+        for pending in pendingConflicts {
+            pending.continuation.resume(returning: .keepLocalOnly)
+        }
+        pendingConflicts = []
     }
 
     // MARK: 数据加载
 
-    func loadBuckets() async {
-        guard let service else { return }
+    private func loadBuckets(using service: any S3Service) async {
+        guard !Task.isCancelled else { return }
         NSLog("[R2BOX] loadBuckets begin")
-        phase = .loading
         // 连接限定了储存桶：跳过 ListBuckets（单桶授权 Token 没有该权限），直接用该桶
-        let pinned = connection?.bucket.trimmingCharacters(in: .whitespaces) ?? ""
-        if !pinned.isEmpty {
+        if let pinned = selectedBucket {
             buckets = [BucketInfo(name: pinned)]
-            selectedBucket = pinned
-            await loadPrefix(bucket: pinned, prefix: "")
+            await loadPrefix(bucket: pinned, prefix: "", using: service)
             return
         }
         do {
-            buckets = try await service.listBuckets()
-            let names = buckets.map { $0.name }
-            NSLog("[R2BOX] loadBuckets ok: \(names)")
-            if selectedBucket == nil || !buckets.contains(where: { $0.name == selectedBucket }) {
-                selectedBucket = buckets.first?.name
-            }
+            let available = try await service.listBuckets()
+            try Task.checkCancellation()
+            buckets = available
+            selectedBucket = available.first?.name
             if let bucket = selectedBucket {
-                await loadPrefix(bucket: bucket, prefix: "")
+                await loadPrefix(bucket: bucket, prefix: "", using: service)
             } else {
                 phase = .loaded
             }
         } catch {
-            phase = .failed(String(describing: error))
+            if !Task.isCancelled { phase = .failed(Self.describe(error)) }
         }
     }
 
-    func loadPrefix(bucket: String, prefix: String) async {
-        guard let service else { return }
-        directoryBusy = true
-        defer { directoryBusy = false }
+    private func loadPrefix(bucket: String, prefix: String, using service: any S3Service) async {
+        guard !Task.isCancelled else { return }
         do {
             let (folders, objects) = try await service.listObjects(bucket: bucket, prefix: prefix)
+            try Task.checkCancellation()
             let folderCount = folders.count, objectCount = objects.count
             NSLog("[R2BOX] loadPrefix \(bucket)/\(prefix): \(folderCount) folders, \(objectCount) objects")
-            self.prefix = prefix
             self.folders = folders
             self.objects = objects
-            selection = nil
             phase = .loaded
         } catch {
-            phase = .failed(String(describing: error))
+            if !Task.isCancelled { phase = .failed(Self.describe(error)) }
         }
     }
 
     func refreshCurrent(quiet: Bool = false) async {
-        guard let bucket = selectedBucket else { return }
-        if !quiet { directoryBusy = true }
-        defer { if !quiet { directoryBusy = false } }
-        guard let service else { return }
+        guard phase == .loaded, let bucket = selectedBucket, let service else { return }
+        let requestID = UUID()
+        refreshRequestID = requestID
+        directoryBusy = directoryBusy || !quiet
+        defer {
+            if refreshRequestID == requestID {
+                refreshRequestID = nil
+                directoryBusy = false
+            }
+        }
         do {
             let (folders, objects) = try await service.listObjects(bucket: bucket, prefix: prefix)
+            guard refreshRequestID == requestID else { return }
             self.folders = folders
             self.objects = objects
-            if let sel = selection, !objects.contains(where: { $0.key == sel.key }) {
-                selection = objects.first { $0.key == sel.key } // 更新 etag/size
-                if self.selection?.etag != sel.etag { self.selection = self.selection }
-            }
+            setRowSelection(selectedRowID)
         } catch {
-            if !quiet { phase = .failed(String(describing: error)) }
+            if refreshRequestID == requestID, !quiet {
+                errorMessage = Self.describe(error)
+            }
         }
     }
 
@@ -374,87 +426,105 @@ final class AppState: Observable {
     func selectBucket(_ name: String) {
         guard buckets.contains(where: { $0.name == name }) else { return }
         selectedBucket = name
-        selection = nil
-        selectedRowID = nil
-        Task { await loadPrefix(bucket: name, prefix: "") }
+        enterFolder("", focusFileTable: false)
     }
 
-    func enterFolder(_ folder: String) {
-        guard let bucket = selectedBucket else { return }
-        selectedRowID = nil
-        Task { await loadPrefix(bucket: bucket, prefix: folder) }
+    func enterFolder(_ folder: String, focusFileTable: Bool = true) {
+        guard let bucket = selectedBucket, let service else { return }
+        beginNavigation(to: folder, focusFileTable: focusFileTable) {
+            await self.loadPrefix(bucket: bucket, prefix: folder, using: service)
+        }
+    }
+
+    private func beginNavigation(
+        to prefix: String,
+        focusFileTable: Bool,
+        load: @escaping @MainActor () async -> Void
+    ) {
+        navigationTask?.cancel()
+        resetDirectory(to: prefix)
+        focusFileTableOnLoad = focusFileTable
+        phase = .loading
+        navigationTask = Task { await load() }
+    }
+
+    private func resetDirectory(to prefix: String) {
+        self.prefix = prefix
+        folders = []
+        objects = []
+        setRowSelection(nil)
+        refreshRequestID = nil
+        directoryBusy = false
+        lastSavedKey = nil
+    }
+
+    func retryBrowsing() {
+        if selectedBucket != nil {
+            enterFolder(prefix)
+        } else if let connection {
+            connect(to: connection)
+        }
     }
 
     func navigateUp() {
-        guard !prefix.isEmpty else { return }
-        var comps = prefix.split(separator: "/").map(String.init)
-        comps.removeLast()
-        let newPrefix = comps.isEmpty ? "" : comps.joined(separator: "/") + "/"
-        guard let bucket = selectedBucket else { return }
-        selection = nil
-        selectedRowID = nil
-        Task { await loadPrefix(bucket: bucket, prefix: newPrefix) }
+        guard let parent = prefix.dropLast().lastIndex(of: "/") else {
+            if !prefix.isEmpty { enterFolder("") }
+            return
+        }
+        enterFolder(String(prefix[...parent]))
     }
 
     var breadcrumbParts: [(name: String, prefix: String)] {
         var parts: [(String, String)] = [(selectedBucket ?? "", "")]
+        guard !prefix.isEmpty else { return parts }
         var acc = ""
-        for comp in prefix.split(separator: "/") {
+        for comp in prefix.dropLast().split(separator: "/", omittingEmptySubsequences: false) {
             acc += comp + "/"
-            parts.append((String(comp), acc))
+            parts.append((comp.isEmpty ? "/" : String(comp), acc))
         }
         return parts
     }
 
-    // MARK: 打开文件（下载 → NSWorkspace 打开）
+    // MARK: 打开与预览文件
 
     func openInEditor(_ entry: ObjectEntry) async {
-        guard let bucket = selectedBucket, let service, let engine else { return }
-        let url = workspace.localURL(bucket: bucket, key: entry.key)
-        do {
-            // 决策：直接用本地副本，还是重新下载（本地缺失/0 字节残留/远程已更新且本地无修改）
-            let plan = await openPlan(for: entry, bucket: bucket, url: url)
-            let etag: String
-            switch plan {
-            case .useLocal:
-                // 本地与远程一致：直接打开。基线维持跟踪记录原值——
-                // 列表里的 etag 可能过期（页面未刷新），用它重登会破坏 If-Match 基线
-                etag = entry.etag
-            case .useLocalExpectConflict:
-                // 远程已变且本地可能有未同步修改：打开本地、保留旧基线，
-                // 下次保存上传命中 If-Match 失败 → 冲突弹窗（绝不静默覆盖）
-                etag = entry.etag
-            case .downloadRemote:
-                upsertDownload(file: entry, bucket: bucket, fraction: 0, state: .active)
-                etag = try await service.download(
-                    bucket: bucket, key: entry.key, destination: url
-                ) { [weak self] fraction in
-                    Task { @MainActor in
-                        self?.upsertDownload(file: entry, bucket: bucket, fraction: fraction, state: .active)
-                    }
-                }
-                upsertDownload(file: entry, bucket: bucket, fraction: 1, state: .done)
-                scheduleTransferCleanup(id: "\(bucket)/\(entry.key)")
-            }
-            switch plan {
-            case .downloadRemote:
-                await engine.track(bucket: bucket, key: entry.key, baseETag: etag)
-                syncStates["\(bucket)/\(entry.key)"] = .synced
-            case .useLocal:
-                // 打开本地副本不动跟踪记录；UI 状态如当前不是失败/冲突则显示已同步
-                if case .failed = syncStates["\(bucket)/\(entry.key)"] {} else {
-                    syncStates["\(bucket)/\(entry.key)"] = .synced
-                }
-            case .useLocalExpectConflict:
-                break  // 状态维持原样（保留旧基线，等保存触发冲突）
-            }
+        if let url = await prepareLocalCopy(of: entry) {
             NSWorkspace.shared.open(url)
+        }
+    }
+
+    func quickLook(_ entry: ObjectEntry) {
+        Task {
+            if let url = await prepareLocalCopy(of: entry) {
+                QLPreviewPanelHelper.shared.toggle(url: url)
+            }
+        }
+    }
+
+    func prepareLocalCopy(of entry: ObjectEntry) async -> URL? {
+        guard let bucket = selectedBucket, let engine else { return nil }
+        let fileID = "\(bucket)/\(entry.key)"
+        do {
+            let local = try await engine.prepareLocalCopy(bucket: bucket, entry: entry) { [weak self, weak engine] fraction in
+                Task { @MainActor in
+                    guard let self, let engine, self.engine === engine else { return }
+                    self.upsertDownload(file: entry, bucket: bucket, fraction: fraction, state: .active)
+                }
+            }
+            guard self.engine === engine, let local else { return nil }
+            if local.downloaded {
+                upsertDownload(file: entry, bucket: bucket, fraction: 1, state: .done)
+                scheduleTransferCleanup(id: fileID)
+                syncStates[fileID] = .synced
+            }
+            return local.url
         } catch {
-            // 打开失败必须浮出：标记失败状态 + 提示条，绝不静默（否则用户以为"已同步"而实际没打开）
-            syncStates["\(bucket)/\(entry.key)"] = .failed(Self.describe(error))
+            guard self.engine === engine else { return nil }
+            syncStates[fileID] = .failed(Self.describe(error))
             upsertDownload(file: entry, bucket: bucket, fraction: 1, state: .failed)
-            scheduleTransferCleanup(id: "\(bucket)/\(entry.key)")
-            errorMessage = "无法打开「\(entry.key.components(separatedBy: "/").last ?? entry.key)」：\(Self.describe(error))"
+            scheduleTransferCleanup(id: fileID)
+            errorMessage = "无法读取「\(entry.fileName)」：\(Self.describe(error))"
+            return nil
         }
     }
 
@@ -469,68 +539,29 @@ final class AppState: Observable {
             case .unknown(let m): return m
             }
         }
-        return String(describing: error)
-    }
-
-    /// 打开决策：结合跟踪基线 / 本地指纹 / 远程 ETag 判断本地副本是否可直接打开
-    private func openPlan(for entry: ObjectEntry, bucket: String, url: URL) async -> OpenPlan {
-        let info = await engine?.trackedInfo(bucket: bucket, key: entry.key)
-        var localMtime: Date?
-        var localSize: Int64?
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) {
-            localMtime = attrs[.modificationDate] as? Date
-            localSize = (attrs[.size] as? NSNumber)?.int64Value
-        }
-        return OpenDecision.plan(
-            localExists: FileManager.default.fileExists(atPath: url.path),
-            remoteSize: entry.size,
-            trackedBaseETag: info?.baseETag,
-            currentETag: entry.etag,
-            syncedMtime: info?.syncedMtime,
-            syncedSize: info?.syncedSize,
-            localMtime: localMtime,
-            localSize: localSize
-        )
-    }
-
-    func quickLook(_ entry: ObjectEntry) {
-        guard let bucket = selectedBucket else { return }
-        let url = workspace.localURL(bucket: bucket, key: entry.key)
-        if FileManager.default.fileExists(atPath: url.path) {
-            // 与打开决策同一套新鲜度判断：本地副本陈旧时先走下载
-            Task {
-                let plan = await openPlan(for: entry, bucket: bucket, url: url)
-                if plan == .downloadRemote {
-                    // 用下载返回的真实 ETag 登记基线（列表值可能过期）
-                    let etag = try? await service?.download(bucket: bucket, key: entry.key, destination: url, progress: nil)
-                    if let etag {
-                        await engine?.track(bucket: bucket, key: entry.key, baseETag: etag)
-                    }
-                }
-                await MainActor.run { QLPreviewPanelHelper.shared.toggle(url: url) }
-            }
-        } else {
-            Task {
-                await openInEditor(entry)   // 下载后打开（Quick Look 场景同样可用）
-                await MainActor.run { QLPreviewPanelHelper.shared.toggle(url: url) }
-            }
-        }
+        return error.localizedDescription
     }
 
     // MARK: 操作
 
     func delete(_ entries: [ObjectEntry]) async {
-        guard let bucket = selectedBucket, let service else { return }
+        guard let bucket = selectedBucket, let service, let engine else { return }
+        let workspace = self.workspace
         for entry in entries {
             let isFolder = entry.key.hasSuffix("/")
-            try? await service.delete(bucket: bucket, key: entry.key, isFolder: isFolder)
+            do {
+                try await service.delete(bucket: bucket, key: entry.key, isFolder: isFolder)
+            } catch {
+                if self.engine === engine { errorMessage = Self.describe(error) }
+                continue
+            }
             if !isFolder {
-                await engine?.untrack(bucket: bucket, key: entry.key)
+                await engine.untrack(bucket: bucket, key: entry.key)
                 workspace.removeLocal(bucket: bucket, key: entry.key)
-                syncStates["\(bucket)/\(entry.key)"] = nil
+                if self.engine === engine { syncStates["\(bucket)/\(entry.key)"] = nil }
             }
         }
-        await refreshCurrent()
+        if self.engine === engine { await refreshCurrent() }
     }
 
     func rename(_ entry: ObjectEntry, newName: String) async {
@@ -548,9 +579,10 @@ final class AppState: Observable {
 
     func uploadFileURLs(_ urls: [URL]) async {
         guard let bucket = selectedBucket, let service else { return }
+        let destinationPrefix = prefix
         for url in urls where !url.hasDirectoryPath {
             let name = url.lastPathComponent
-            let destKey = prefix + name
+            let destKey = destinationPrefix + name
             let tempEntry = ObjectEntry(
                 key: destKey, size: 0, lastModified: Date(), etag: ""
             )
@@ -622,9 +654,11 @@ final class AppState: Observable {
     }
 
     private func scheduleTransferCleanup(id: String) {
+        let scope = workspace.baseURL
         Task { [weak self] in
             try? await Task.sleep(for: .seconds(4))
-            self?.transfers.removeAll { $0.id == id && ($0.state == .done) }
+            guard let self, self.workspace.baseURL == scope else { return }
+            self.transfers.removeAll { $0.id == id && $0.state == .done }
         }
     }
 }

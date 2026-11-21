@@ -1,15 +1,10 @@
 import SwiftUI
-import R2BOXCore
-import R2BOXSync
 
 @main
 struct R2BOXApp: App {
-    @Environment(\.scenePhase) private var scenePhase
     private let appState = SharedState.app
 
     init() {
-        KeyHandler.shared.install()
-        ToolbarTuner.install()
         if CommandLine.arguments.contains("--selftest") {
             SelfTest.run()
         }
@@ -19,16 +14,17 @@ struct R2BOXApp: App {
         WindowGroup {
             ContentView()
                 .environment(appState)
-                .frame(minWidth: 980, minHeight: 600)
+                .frame(minWidth: 760, minHeight: 480)
         }
-        .windowStyle(.automatic)
-        .defaultSize(width: 1180, height: 720)
+        .windowToolbarStyle(.unified)
+        .windowResizability(.contentMinSize)
+        .defaultSize(width: 1080, height: 680)
         .commands { AppCommands() }
 
         Settings {
             SettingsView()
                 .environment(appState)
-                .frame(width: 460, height: 260)
+                .frame(width: 500, height: 200)
         }
     }
 }
@@ -50,8 +46,7 @@ struct AppCommands: Commands {
 
         CommandGroup(after: .newItem) {
             Button("新建连接…") {
-                state.editingConnection = nil
-                state.showConnectionSheet = true
+                state.presentConnectionSheet()
             }
             .keyboardShortcut("n", modifiers: [.command, .shift])
         }
@@ -79,8 +74,6 @@ struct AppCommands: Commands {
         }
 
         CommandMenu("前往") {
-            // 注意：Enter / 空格不在菜单注册——裸键菜单项会全局劫持按键（含表单输入）。
-            // 文件列表聚焦时由 FileListView 的 onKeyPress 处理 Enter / 空格 / 方向键。
             Button("在默认编辑器中打开") {
                 if let selection = state.selection {
                     Task { await state.openInEditor(selection) }

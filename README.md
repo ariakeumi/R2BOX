@@ -18,7 +18,7 @@
 | 按键 | 作用 |
 |---|---|
 | ⌘1 ~ ⌘9 | 切换侧边栏连接（一个连接 = 一个储存桶） |
-| ↑ / ↓ | 移动文件列表选中项 |
+| ↑ / ↓ | 移动当前侧栏或文件表格的选中项 |
 | Enter | 打开文件 / 进入文件夹 |
 | 空格 | Quick Look 预览 |
 | ⌘S | 立即同步选中文件 |
@@ -37,11 +37,11 @@
 
 ## 构建运行
 
-需要 macOS 14+ 与 Xcode Command Line Tools（无需完整 Xcode）。
+运行需要 macOS 14+。构建请使用包含 macOS 27 SDK 的 Xcode 27 或 Command Line Tools。
 
 ```bash
 ./scripts/run.sh --release --open   # 构建 R2BOX.app 并打开
-swift run R2BOXChecker              # 运行校验套件（30 项）
+swift run R2BOXChecker              # 运行校验套件
 .build/release/R2BOXApp --selftest  # 进程内端到端自检
 swift scripts/make_icon.swift <dir> # 重新生成应用图标
 ```
@@ -60,7 +60,8 @@ scripts/run.sh       # 打包 R2BOX.app（Info.plist / 图标 / 签名）
 ## 数据位置
 
 - 配置与本地工作区：`~/Library/Application Support/R2BOX/`
-  - `connections.json` 连接配置；`workspace/<bucket>/<key>` 本地缓存；`.r2box/tracked.json` 同步基线
+  - `connections.json` 保存连接配置。每个连接在 `workspace/.connections/<连接 ID>/<连接配置指纹>/` 下保存本地缓存和 `.r2box/tracked.json` 同步基线。
+  - 升级前位于 `workspace/<bucket>/<key>` 的副本会原地保留。若其中有未上传的修改，请在对应连接中打开文件，核对后再将旧修改复制到新的本地副本。
 - Secret Access Key：macOS 钥匙串（不落盘、不进配置文件）
 
 ## License

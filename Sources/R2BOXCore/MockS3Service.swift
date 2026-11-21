@@ -123,14 +123,6 @@ public actor MockS3Service: S3Service {
         try ensureOnline()
         try await jitter(80...200)
 
-        // 条件写入：远程 ETag 与 ifMatch 不一致 → 冲突（412）
-        if let expected = ifMatch {
-            let current = await data.snapshot(bucket: bucket, key: key)?.etag
-            if let current, current != expected {
-                throw S3Error.preconditionFailed
-            }
-        }
-
         // 流式分块读取本地文件
         let handle = try FileHandle(forReadingFrom: source)
         defer { try? handle.close() }
@@ -150,7 +142,7 @@ public actor MockS3Service: S3Service {
             try await Task.sleep(for: chunkDelay)
         }
         try ensureOnline()
-        return await data.put(bucket: bucket, key: key, data: buffer)
+        return try await data.put(bucket: bucket, key: key, data: buffer, ifMatch: ifMatch)
     }
 
     public func delete(bucket: String, key: String, isFolder: Bool) async throws {

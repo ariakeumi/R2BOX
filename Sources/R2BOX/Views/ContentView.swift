@@ -1,49 +1,44 @@
 import SwiftUI
-import R2BOXCore
-import R2BOXSync
 
 struct ContentView: View {
     @Environment(AppState.self) private var state
 
     var body: some View {
-        NavigationSplitView(columnVisibility: .constant(.all)) {
+        let conflictID = state.conflictDialog?.id
+        NavigationSplitView {
             SidebarView()
-                .toolbar(removing: .sidebarToggle)
-                .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 340)
+                .navigationSplitViewColumnWidth(min: 180, ideal: 224, max: 320)
         } detail: {
             BrowserView()
         }
+        .navigationSplitViewStyle(.balanced)
         .sheet(isPresented: Binding(
             get: { state.showConnectionSheet },
             set: { state.showConnectionSheet = $0 }
-        )) {
+        ), onDismiss: state.presentNextConflict) {
             ConnectionSheet()
         }
-        .alert(
-            "检测到同步冲突",
-            isPresented: Binding(
-                get: { state.conflictDialog != nil },
-                set: { if !$0 { state.resolveConflict(.keepLocalOnly) } }
+        .sheet(
+            item: Binding(
+                get: { state.conflictDialog },
+                set: { if $0 == nil, let conflictID { state.resolveConflict(.keepLocalOnly, id: conflictID) } }
             ),
-            presenting: state.conflictDialog
+            onDismiss: state.conflictDialogDidDismiss
         ) { ctx in
-            Button {
-                state.resolveConflict(.overwriteRemote)
-            } label: {
-                Text("覆盖远程")
+            VStack(alignment: .leading, spacing: 16) {
+                Text("检测到同步冲突")
+                    .font(.headline)
+                Text(Self.conflictDetail(for: ctx))
+                HStack {
+                    Button("保留本地文件") { state.resolveConflict(.keepLocalOnly, id: ctx.id) }
+                        .keyboardShortcut(.cancelAction)
+                    Spacer()
+                    Button("重新加载远程") { state.resolveConflict(.reloadRemote, id: ctx.id) }
+                    Button("覆盖远程") { state.resolveConflict(.overwriteRemote, id: ctx.id) }
+                }
             }
-            Button {
-                state.resolveConflict(.reloadRemote)
-            } label: {
-                Text("重新加载远程")
-            }
-            Button {
-                state.resolveConflict(.keepLocalOnly)
-            } label: {
-                Text("保留本地文件")
-            }
-        } message: { ctx in
-            Text(Self.conflictDetail(for: ctx))
+            .padding(24)
+            .frame(width: 470)
         }
         .alert(
             "操作失败",
@@ -61,13 +56,12 @@ struct ContentView: View {
             // selftest 模式：进程里跑的是隔离 AppState，UI 不自动连接真实连接
             guard !CommandLine.arguments.contains("--selftest") else { return }
             if state.connection == nil, let conn = ConnectionManager.shared.selected {
-                state.connect(to: conn)
+                state.connect(to: conn, focusFileTable: true)
             }
         }
     }
 
     private static func conflictDetail(for ctx: AppState.ConflictContext) -> String {
-        let name = ctx.file.key.components(separatedBy: "/").last ?? ctx.file.key
-        return "「\(name)」在远程已被修改（ETag 不一致），本地也有未同步的修改。\n\n覆盖远程：用本地内容替换远程版本\n重新加载远程：放弃本地修改，下载远程最新版本\n保留本地：暂不上传，保留本地副本"
+        "「\(ctx.file.bucket)/\(ctx.file.key)」的本地和远端版本都已修改。覆盖远程会上传本地版本，重新加载会放弃当前本地修改。"
     }
 }

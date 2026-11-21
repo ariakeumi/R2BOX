@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Network
 import R2BOXCore
@@ -57,17 +58,18 @@ public actor SyncEngine {
 
     private let workspace: Workspace
     /// 引擎所用的 S3 服务句柄（自检/诊断用）
-    public let service: S3Service
+    public nonisolated let service: S3Service
     private let metadata: MetadataStore
 
-    /// key: "bucket/key"（key 已 URL 编码，无歧义）
-    private var tracked: [String: TrackedInfo] = [:]
-    private var retryQueue: Set<String> = []
-    private var uploading: Set<String> = []
-    private var uploadProgressMap: [String: Double] = [:]
-    private var conflictPending: Set<String> = []
+    private var tracked: [TrackedFile: TrackedInfo] = [:]
+    private var restored = false
+    private var retryQueue: Set<TrackedFile> = []
+    private enum Operation { case uploading, downloading, invalidated }
+    private var operations: [TrackedFile: Operation] = [:]
+    private var conflictPending: Set<TrackedFile> = []
+    private var keptLocal: [TrackedFile: Fingerprint] = [:]
     private var outage = false
-    private var debouncers: [String: Debouncer] = [:]
+    private var debouncers: [TrackedFile: Debouncer] = [:]
     private var retryTask: Task<Void, Never>?
     private let retryDelay: Duration
     private var pathMonitor: NWPathMonitor?
@@ -102,278 +104,373 @@ public actor SyncEngine {
             // 防御：拒绝 key 自带 bucket 前缀的坏记录（历史上会写出双层路径）
             return
         }
-        let fileID = id(TrackedFile(bucket: bucket, key: key))
-        let fingerprint = localFingerprint(bucket: bucket, key: key)
-        tracked[fileID] = tracked[fileID].map { info in
-            var i = info
-            i.baseETag = baseETag
-            i.dirty = false
-            i.failedReason = nil
-            i.syncedMtime = fingerprint?.mtime
-            i.syncedSize = fingerprint?.size
-            return i
-        } ?? TrackedInfo(
-            baseETag: baseETag,
+        let file = TrackedFile(bucket: bucket, key: key)
+        if operations[file] != nil { operations[file] = .invalidated }
+        recordSync(file, etag: baseETag, fingerprint: localFingerprint(file))
+    }
+
+    private func recordSync(_ file: TrackedFile, etag: String, fingerprint: Fingerprint?, dirty: Bool = false) {
+        tracked[file] = TrackedInfo(
+            baseETag: etag,
+            dirty: dirty,
             syncedMtime: fingerprint?.mtime,
             syncedSize: fingerprint?.size
         )
         metadata.record(
-            bucket: bucket, key: key, baseETag: baseETag,
+            bucket: file.bucket, key: file.key, baseETag: etag,
             syncedMtime: fingerprint?.mtime, syncedSize: fingerprint?.size
         )
-        retryQueue.remove(fileID)
-        conflictPending.remove(fileID)
+        retryQueue.remove(file)
+        keptLocal.removeValue(forKey: file)
     }
 
-    private struct Fingerprint {
+    private struct Fingerprint: Equatable {
         var mtime: Date
         var size: Int64
+        var fileNumber: UInt64?
     }
 
-    private func localFingerprint(bucket: String, key: String) -> Fingerprint? {
-        let url = workspace.localURL(bucket: bucket, key: key)
+    private func localURL(_ file: TrackedFile) -> URL {
+        workspace.localURL(bucket: file.bucket, key: file.key)
+    }
+
+    private func localFingerprint(_ file: TrackedFile) -> Fingerprint? {
+        fingerprint(at: localURL(file).resolvingSymlinksInPath())
+    }
+
+    private func fingerprint(at url: URL) -> Fingerprint? {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) else { return nil }
         return Fingerprint(
             mtime: attrs[.modificationDate] as? Date ?? Date.distantPast,
-            size: (attrs[.size] as? NSNumber)?.int64Value ?? 0
+            size: (attrs[.size] as? NSNumber)?.int64Value ?? 0,
+            fileNumber: (attrs[.systemFileNumber] as? NSNumber)?.uint64Value
         )
     }
 
     public func untrack(bucket: String, key: String) {
-        let key = id(TrackedFile(bucket: bucket, key: key))
-        tracked[key] = nil
-        retryQueue.remove(key)
-        debouncers[key] = nil
+        let file = TrackedFile(bucket: bucket, key: key)
+        if operations[file] != nil { operations[file] = .invalidated }
+        tracked[file] = nil
+        retryQueue.remove(file)
+        conflictPending.remove(file)
+        keptLocal.removeValue(forKey: file)
+        if let debouncer = debouncers.removeValue(forKey: file) {
+            Task { await debouncer.cancel() }
+        }
         metadata.remove(bucket: bucket, key: key)
     }
 
     public func isTracked(bucket: String, key: String) -> Bool {
-        tracked[id(TrackedFile(bucket: bucket, key: key))] != nil
+        tracked[TrackedFile(bucket: bucket, key: key)] != nil
     }
 
     public func trackedInfo(bucket: String, key: String) -> TrackedInfo? {
-        tracked[id(TrackedFile(bucket: bucket, key: key))]
+        tracked[TrackedFile(bucket: bucket, key: key)]
     }
 
     public func failedFiles() -> [TrackedFile] {
-        retryQueue.compactMap { id -> TrackedFile? in
-            let comps = id.split(separator: "/", maxSplits: 1).map(String.init)
-            guard comps.count == 2 else { return nil }
-            return TrackedFile(bucket: comps[0], key: comps[1])
-        }
+        Array(retryQueue)
     }
 
     public var hasOutage: Bool { outage }
 
     /// UI 查询某文件当前的同步状态
     public func status(bucket: String, key: String) -> FileSyncStatus {
-        statusByID(id(TrackedFile(bucket: bucket, key: key)))
+        status(of: TrackedFile(bucket: bucket, key: key))
     }
 
     /// 一次性导出全部跟踪文件的同步状态（key: "bucket/key"），用于 UI 状态镜像
     public func allStatuses() -> [String: FileSyncStatus] {
         var out: [String: FileSyncStatus] = [:]
-        for fileID in tracked.keys {
-            out[fileID] = statusByID(fileID)
+        for file in tracked.keys {
+            out[id(file)] = status(of: file)
         }
         return out
     }
 
-    private func statusByID(_ fileID: String) -> FileSyncStatus {
-        if conflictPending.contains(fileID) { return .conflict }
-        if let fraction = uploadProgressMap[fileID] { return .uploading(fraction) }
-        guard let info = tracked[fileID] else { return .remoteOnly }
+    private func status(of file: TrackedFile) -> FileSyncStatus {
+        guard let info = tracked[file] else { return .remoteOnly }
+        if conflictPending.contains(file) { return .conflict }
+        if operations[file] == .uploading { return .uploading(0) }
         if let reason = info.failedReason { return .failed(reason) }
         if info.dirty { return .dirty }
         return .synced
     }
 
-    /// 应用启动时从磁盘恢复跟踪清单
+    /// 从磁盘恢复同步基线，并识别应用关闭期间留下的修改。
     public func restoreFromDisk() {
+        guard !restored else { return }
+        restored = true
         for entry in metadata.loadAll() {
-            let key = id(TrackedFile(bucket: entry.bucket, key: entry.key))
-            if tracked[key] == nil {
-                tracked[key] = TrackedInfo(
-                    baseETag: entry.baseETag,
-                    syncedMtime: entry.syncedMtime,
-                    syncedSize: entry.syncedSize
-                )
+            let file = TrackedFile(bucket: entry.bucket, key: entry.key)
+            guard tracked[file] == nil else { continue }
+            let fingerprint = localFingerprint(file)
+            let dirty: Bool
+            if let mtime = entry.syncedMtime, let size = entry.syncedSize, let fingerprint {
+                dirty = fingerprint.mtime != mtime || fingerprint.size != size
+            } else {
+                dirty = false
+            }
+            tracked[file] = TrackedInfo(
+                baseETag: entry.baseETag, dirty: dirty,
+                syncedMtime: entry.syncedMtime, syncedSize: entry.syncedSize
+            )
+        }
+    }
+
+    /// 编辑和预览共用同一套打开规则。下载期间发生的新修改会保留。
+    public func prepareLocalCopy(
+        bucket: String, entry: ObjectEntry, progress: ProgressHandler?
+    ) async throws -> (url: URL, downloaded: Bool)? {
+        restoreFromDisk()
+        let file = TrackedFile(bucket: bucket, key: entry.key)
+        let url = localURL(file)
+        let fingerprint = localFingerprint(file)
+        let info = tracked[file]
+        if let operation = operations[file] {
+            guard operation == .uploading else { return nil }
+            return fingerprint.map { _ in (url, false) }
+        }
+        let plan = OpenDecision.plan(
+            localExists: fingerprint != nil, remoteSize: entry.size,
+            trackedBaseETag: info?.baseETag, currentETag: entry.etag,
+            syncedMtime: info?.syncedMtime, syncedSize: info?.syncedSize,
+            localMtime: fingerprint?.mtime, localSize: fingerprint?.size,
+            localDirty: info?.dirty ?? false
+        )
+        guard plan == .downloadRemote else { return (url, false) }
+
+        operations[file] = .downloading
+        defer { operations[file] = nil }
+        do {
+            _ = try await downloadAndTrack(file, replacing: fingerprint, progress: progress)
+            return (url, true)
+        } catch is CancellationError {
+            return nil
+        }
+    }
+
+    /// 用户显式要求重新下载（放弃当前本地修改）。
+    public func reloadFromRemote(bucket: String, key: String) async throws -> String {
+        let file = TrackedFile(bucket: bucket, key: key)
+        guard operations[file] == nil else { throw S3Error.unknown("文件正在同步") }
+        operations[file] = .downloading
+        defer { operations[file] = nil }
+        return try await downloadAndTrack(file, replacing: localFingerprint(file), progress: nil)
+    }
+
+    private enum LocalChange: LocalizedError {
+        case duringUpload
+        case duringDownload
+
+        var errorDescription: String? {
+            switch self {
+            case .duringUpload: "读取上传副本时本地文件发生变化"
+            case .duringDownload: "下载期间本地文件发生变化，已保留本地修改"
             }
         }
     }
 
-    /// 用户显式要求重新下载（放弃本地修改）
-    public func reloadFromRemote(bucket: String, key: String) async throws -> String {
-        let url = workspace.localURL(bucket: bucket, key: key)
-        let etag = try await service.download(bucket: bucket, key: key, destination: url, progress: nil)
-        track(bucket: bucket, key: key, baseETag: etag)
+    private func temporaryURL() -> URL {
+        workspace.baseURL.appendingPathComponent(WorkspaceWatcher.metadataFolderName, isDirectory: true)
+            .appendingPathComponent(UUID().uuidString)
+    }
+
+    private func downloadAndTrack(
+        _ file: TrackedFile, replacing fingerprint: Fingerprint?, progress: ProgressHandler?
+    ) async throws -> String {
+        let staging = temporaryURL()
+        let fm = FileManager.default
+        defer { try? fm.removeItem(at: staging) }
+        progress?(0)
+        let etag = try await service.download(
+            bucket: file.bucket, key: file.key, destination: staging, progress: progress
+        )
+        guard operations[file] != .invalidated else { throw CancellationError() }
+        guard !etag.isEmpty else { throw S3Error.unknown("下载响应缺少 ETag，已保留本地文件") }
+        let destination = localURL(file)
+        try fm.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let downloadedFingerprint = self.fingerprint(at: staging)
+        guard fingerprint == localFingerprint(file) else {
+            tracked[file]?.dirty = true
+            throw LocalChange.duringDownload
+        }
+        guard rename(staging.path, destination.path) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        recordSync(file, etag: etag, fingerprint: downloadedFingerprint)
         return etag
     }
 
-    /// ⌘S / 菜单触发的立即同步：先取远程最新 ETag 作为写入基线（最后写入者胜）
+    /// ⌘S / 菜单跳过防抖，沿用原来的写入基线。
     public func forceUpload(bucket: String, key: String) async {
-        let fileID = id(TrackedFile(bucket: bucket, key: key))
-        guard tracked[fileID] != nil else { return }
-        if let remote = try? await service.headObject(bucket: bucket, key: key) {
-            tracked[fileID]?.baseETag = remote.etag
-        }
-        await performUpload(bucket: bucket, key: key)
+        restoreFromDisk()
+        await performUpload(TrackedFile(bucket: bucket, key: key), manual: true)
     }
 
     // MARK: - FSEvents 入口
 
-    /// WorkspaceWatcher 的回调入口：相对路径 → bucket/key，防抖后调度上传
     public func handleWorkspaceChanges(_ relativePaths: [String]) {
-        var affected = Set<String>()
+        var affected = Set<TrackedFile>()
         for path in relativePaths {
-            let parts = path.split(separator: "/").map(String.init)
-            guard let bucket = parts.first, parts.count >= 2 else { continue }
-            if bucket == WorkspaceWatcher.metadataFolderName { continue }
-            if parts.contains(WorkspaceWatcher.tempFolderName) { continue }
-            if parts.last == ".DS_Store" { continue }
-            let key = parts.dropFirst().joined(separator: "/")
-            guard !key.isEmpty, !key.hasSuffix("/") else { continue }
-            let fileID = "\(bucket)/\(key)"
-            guard tracked[fileID] != nil else { continue }  // 只跟踪我们管理的文件
-            affected.insert(fileID)
+            let parts = path.split(separator: "/", maxSplits: 1)
+            guard parts.count == 2, parts[0] != WorkspaceWatcher.metadataFolderName else { continue }
+            let key = String(parts[1])
+            let components = key.split(separator: "/")
+            guard !components.contains(where: { $0 == WorkspaceWatcher.tempFolderName }),
+                  components.last != ".DS_Store", !key.hasSuffix("/") else { continue }
+            let file = TrackedFile(bucket: String(parts[0]), key: key)
+            if tracked[file] != nil { affected.insert(file) }
         }
-        for fileID in affected {
-            let comps = fileID.split(separator: "/", maxSplits: 1).map(String.init)
-            guard comps.count == 2 else { continue }
-            let debouncer = debouncers[fileID] ?? Debouncer(delay: .milliseconds(600))
-            debouncers[fileID] = debouncer
-            let bucket = comps[0], key = comps[1]
-            Task { await debouncer.fire { await self.performUpload(bucket: bucket, key: key) } }
+        for file in affected {
+            let debouncer = debouncers[file] ?? Debouncer(delay: .milliseconds(600))
+            debouncers[file] = debouncer
+            let upload: @Sendable () async -> Void = { [weak self] in
+                await self?.performUpload(file)
+            }
+            Task { await debouncer.fire(upload) }
         }
     }
 
     // MARK: - 上传
 
-    private func performUpload(bucket: String, key: String) async {
-        let file = TrackedFile(bucket: bucket, key: key)
-        let fileID = id(file)
-        guard var info = tracked[fileID] else { return }
-
-        let url = workspace.localURL(bucket: bucket, key: key)
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            // 本地文件被删 —— 不自动删远程，仅停止跟踪
-            tracked[fileID] = nil
-            metadata.remove(bucket: bucket, key: key)
-            return
-        }
-
-        // 指纹未变（下载落盘产生的事件 / rename 报的事件 / 重复事件）→ 跳过上传
-        if let mtime = info.syncedMtime, let size = info.syncedSize,
-           let current = localFingerprint(bucket: bucket, key: key),
-           current.mtime == mtime, current.size == size, !info.dirty {
-            return
-        }
-
-        if uploading.contains(fileID) {
-            info.dirty = true
-            tracked[fileID] = info
-            return  // 正在传；传完后若 dirty 会再触发
-        }
-        uploading.insert(fileID)
-        uploadProgressMap[fileID] = 0
-        defer {
-            uploading.remove(fileID)
-            uploadProgressMap[fileID] = nil
-        }
-
-        info.dirty = false
-        tracked[fileID] = info
-
-        do {
-            emit(.uploadStarted(file))
-            let newETag = try await service.upload(
-                bucket: bucket, key: key, source: url, ifMatch: info.baseETag
-            ) { [eventHandler] fraction in
-                eventHandler(.uploadProgress(file, fraction: fraction))
+    private func performUpload(_ file: TrackedFile, manual: Bool = false) async {
+        guard tracked[file] != nil, operations[file] == nil else { return }
+        operations[file] = .uploading
+        defer { operations[file] = nil }
+        retryQueue.remove(file)
+        var confirmedETag: String?
+        while operations[file] == .uploading, let info = tracked[file] {
+            guard let fingerprint = localFingerprint(file) else {
+                untrack(bucket: file.bucket, key: file.key)
+                return
             }
-            uploadProgressMap[fileID] = nil
-            if var latest = tracked[fileID] {
-                latest.baseETag = newETag
-                latest.failedReason = nil
-                // 上传成功后此刻的文件即与远程一致，记录指纹
-                if let current = localFingerprint(bucket: bucket, key: key) {
-                    latest.syncedMtime = current.mtime
-                    latest.syncedSize = current.size
+            if !manual && keptLocal[file] == fingerprint { return }
+            if !info.dirty && fingerprint.mtime == info.syncedMtime && fingerprint.size == info.syncedSize {
+                return
+            }
+
+            let ifMatch = confirmedETag ?? info.baseETag
+            guard !ifMatch.isEmpty else {
+                reportFailure(file, reason: "缺少远端 ETag，已保留本地修改")
+                return
+            }
+
+            tracked[file]?.dirty = true
+            do {
+                let etag = try await uploadSnapshot(file, fingerprint: fingerprint, ifMatch: ifMatch)
+                guard operations[file] == .uploading else { return }
+                updateOutage(false)
+                guard !etag.isEmpty else {
+                    reportFailure(file, reason: "上传响应缺少 ETag，无法确认同步版本")
+                    return
                 }
-                tracked[fileID] = latest
+                let dirty = localFingerprint(file) != fingerprint
+                recordSync(file, etag: etag, fingerprint: fingerprint, dirty: dirty)
+                if dirty {
+                    confirmedETag = nil
+                    continue
+                }
+                emit(.uploadDone(file, etag: etag))
+                return
+            } catch S3Error.preconditionFailed {
+                guard operations[file] == .uploading else { return }
+                guard let etag = await resolveConflict(file, baseETag: info.baseETag) else { return }
+                confirmedETag = etag
+            } catch {
+                guard operations[file] == .uploading else { return }
+                handleFailure(file, error: error, operation: "上传")
+                return
             }
-            let settledFingerprint = localFingerprint(bucket: bucket, key: key)
-            metadata.record(
-                bucket: bucket, key: key, baseETag: newETag,
-                syncedMtime: settledFingerprint?.mtime, syncedSize: settledFingerprint?.size
-            )
-            retryQueue.remove(fileID)
-            conflictPending.remove(fileID)
-            emit(.uploadDone(file, etag: newETag))
-        } catch let error as S3Error {
-            switch error {
-            case .preconditionFailed:
-                conflictPending.insert(fileID)
-                uploadProgressMap[fileID] = nil
-                await resolveConflict(file: file, fileID: fileID)
-            case .network:
-                info.failedReason = "网络中断，本地修改已保留"
-                tracked[fileID] = info
-                retryQueue.insert(fileID)
-                emit(.uploadFailed(file, reason: info.failedReason!))
-                await setOutage(true)
-                scheduleRetry()
-            default:
-                info.failedReason = "上传失败：\(error)"
-                tracked[fileID] = info
-                retryQueue.insert(fileID)
-                emit(.uploadFailed(file, reason: info.failedReason!))
-                scheduleRetry()
-            }
-        } catch {
-            info.failedReason = error.localizedDescription
-            tracked[fileID] = info
-            retryQueue.insert(fileID)
-            emit(.uploadFailed(file, reason: error.localizedDescription))
-            scheduleRetry()
         }
     }
 
-    /// 上传成功完成后，若期间又有本地修改（dirty），再传一轮
-    private func scheduleRetry() {
-        retryTask?.cancel()
-        retryTask = Task { [retryDelay] in
-            try? await Task.sleep(for: retryDelay)
-            guard !Task.isCancelled else { return }
-            await self.retryFailed()
+    private func uploadSnapshot(_ file: TrackedFile, fingerprint: Fingerprint, ifMatch: String) async throws -> String {
+        let snapshot = temporaryURL()
+        let fm = FileManager.default
+        defer { try? fm.removeItem(at: snapshot) }
+        let source = localURL(file).resolvingSymlinksInPath()
+        if clonefile(source.path, snapshot.path, 0) != 0 {
+            try fm.copyItem(at: source, to: snapshot)
         }
+        guard fingerprint == localFingerprint(file) else { throw LocalChange.duringUpload }
+        emit(.uploadStarted(file))
+        return try await service.upload(
+            bucket: file.bucket, key: file.key, source: snapshot, ifMatch: ifMatch
+        ) { [eventHandler] fraction in
+            eventHandler(.uploadProgress(file, fraction: fraction))
+        }
+    }
+
+    private func reportFailure(_ file: TrackedFile, reason: String, retry: Bool = false) {
+        tracked[file]?.failedReason = reason
+        if retry {
+            retryQueue.insert(file)
+            scheduleRetry()
+        }
+        emit(.uploadFailed(file, reason: reason))
+    }
+
+    private func handleFailure(_ file: TrackedFile, error: Error, operation: String, retry: Bool = true) {
+        switch error as? S3Error {
+        case .notFound:
+            updateOutage(false)
+            reportFailure(file, reason: "远程对象已不存在，本地修改已保留")
+        case .accessDenied:
+            reportFailure(file, reason: "\(operation)失败：访问被拒绝，本地修改已保留")
+        case .unknown(let reason):
+            reportFailure(file, reason: "\(operation)失败：\(reason)", retry: retry)
+        default:
+            if (error as? S3Error) == .network || error is URLError {
+                updateOutage(true)
+                reportFailure(file, reason: "\(operation)时网络不可用，本地修改已保留", retry: retry)
+            } else {
+                reportFailure(file, reason: "\(operation)失败：\(error.localizedDescription)", retry: retry)
+            }
+        }
+    }
+
+    private func scheduleRetry() {
+        guard retryTask == nil else { return }
+        retryTask = Task { [weak self, retryDelay] in
+            do {
+                try await Task.sleep(for: retryDelay)
+            } catch {
+                return
+            }
+            await self?.retryAfterDelay()
+        }
+    }
+
+    private func retryAfterDelay() async {
+        retryTask = nil
+        await retryFailed()
     }
 
     public func retryFailed() async {
-        let ids = retryQueue
-        retryQueue.removeAll()
-        for fileID in ids {
-            let comps = fileID.split(separator: "/", maxSplits: 1).map(String.init)
-            guard comps.count == 2 else { continue }
-            await performUpload(bucket: comps[0], key: comps[1])
+        let files = retryQueue.filter { operations[$0] == nil }
+        await withTaskGroup(of: Void.self) { group in
+            for file in files {
+                group.addTask { await self.performUpload(file) }
+            }
         }
     }
 
-    /// 断网模拟开关（真实实现里由网络监听触发）
+    /// 断网模拟开关。
     public func setOutage(_ on: Bool) async {
-        if outage == on { return }
-        outage = on
         if let mock = service as? MockS3Service {
             await mock.setOutage(on)
         }
-        emit(.outageChanged(on))
-        if !on {
-            await retryFailed()  // 恢复网络，立即续传
-        }
+        updateOutage(on)
+        if !on { await retryFailed() }
     }
 
-    /// 启动系统网络监听：NWPath 恢复 satisfied 时自动续传重试队列。
-    /// Mock 断网模拟仍走 setOutage；真实服务的瞬时断网由系统监听驱动。
+    private func updateOutage(_ on: Bool) {
+        guard outage != on else { return }
+        outage = on
+        emit(.outageChanged(on))
+    }
+
     public func startNetworkMonitoring() {
         guard pathMonitor == nil else { return }
         let monitor = NWPathMonitor()
@@ -387,79 +484,51 @@ public actor SyncEngine {
 
     deinit {
         pathMonitor?.cancel()
+        retryTask?.cancel()
     }
 
-    /// 网络恢复：清失败标记并续传
     private func networkRecovered() async {
-        var hadFailures = false
-        for (fileID, var info) in tracked {
-            if info.failedReason != nil {
-                info.failedReason = nil
-                tracked[fileID] = info
-                hadFailures = true
-            }
-        }
-        emit(.outageChanged(false))
-        if hadFailures || !retryQueue.isEmpty {
-            await retryFailed()
-        }
+        updateOutage(false)
+        await retryFailed()
     }
 
     // MARK: - 冲突
 
-    private func resolveConflict(file: TrackedFile, fileID: String) async {
-        let remote = try? await service.headObject(bucket: file.bucket, key: file.key)
-        guard let remote else {
-            tracked[fileID]?.failedReason = "远程文件已不存在"
-            return
+    private func resolveConflict(_ file: TrackedFile, baseETag: String) async -> String? {
+        conflictPending.insert(file)
+        defer { conflictPending.remove(file) }
+        let remote: ObjectEntry
+        do {
+            guard let entry = try await service.headObject(bucket: file.bucket, key: file.key) else {
+                throw S3Error.notFound
+            }
+            remote = entry
+        } catch {
+            if operations[file] == .uploading { handleFailure(file, error: error, operation: "查询远端版本") }
+            return nil
         }
-        emit(.conflictDetected(file, localETagBase: remote.etag, remote: remote))
-        let choice = await conflictHandler(file, remote.etag, remote)
+        guard operations[file] == .uploading else { return nil }
+        updateOutage(false)
+        emit(.conflictDetected(file, localETagBase: baseETag, remote: remote))
+        let choice = await conflictHandler(file, baseETag, remote)
+        guard operations[file] == .uploading else { return nil }
         switch choice {
         case .overwriteRemote:
-            do {
-                let url = workspace.localURL(bucket: file.bucket, key: file.key)
-                let newETag = try await service.upload(
-                    bucket: file.bucket, key: file.key, source: url, ifMatch: remote.etag, progress: nil
-                )
-                if var info = tracked[fileID] {
-                    info.baseETag = newETag
-                    info.dirty = false
-                    info.failedReason = nil
-                    if let current = localFingerprint(bucket: file.bucket, key: file.key) {
-                        info.syncedMtime = current.mtime
-                        info.syncedSize = current.size
-                    }
-                    tracked[fileID] = info
-                }
-                let settledFingerprint = localFingerprint(bucket: file.bucket, key: file.key)
-                metadata.record(
-                    bucket: file.bucket, key: file.key, baseETag: newETag,
-                    syncedMtime: settledFingerprint?.mtime, syncedSize: settledFingerprint?.size
-                )
-                retryQueue.remove(fileID)
-                conflictPending.remove(fileID)
-                emit(.uploadDone(file, etag: newETag))
-            } catch {
-                retryQueue.insert(fileID)
-                scheduleRetry()
-                emit(.uploadFailed(file, reason: "覆盖远程失败：\(error)"))
-            }
+            return remote.etag
         case .reloadRemote:
+            operations[file] = .downloading
             do {
-                let etag = try await reloadFromRemote(bucket: file.bucket, key: file.key)
-                conflictPending.remove(fileID)
-                retryQueue.remove(fileID)
+                let etag = try await downloadAndTrack(file, replacing: localFingerprint(file), progress: nil)
                 emit(.uploadDone(file, etag: etag))
             } catch {
-                emit(.uploadFailed(file, reason: "重新下载失败：\(error)"))
+                if operations[file] == .downloading {
+                    handleFailure(file, error: error, operation: "重新下载", retry: false)
+                }
             }
         case .keepLocalOnly:
-            if var info = tracked[fileID] {
-                info.failedReason = "已保留本地副本（未上传）"
-                tracked[fileID] = info
-                conflictPending.remove(fileID)
-            }
+            keptLocal[file] = localFingerprint(file)
+            reportFailure(file, reason: "已保留本地副本（未上传）")
         }
+        return nil
     }
 }

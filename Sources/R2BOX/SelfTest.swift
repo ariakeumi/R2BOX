@@ -3,8 +3,7 @@ import R2BOXCore
 import R2BOXSync
 
 /// 进程内端到端自检：`R2BOX --selftest`
-/// 在真实 App 进程里走完整链路（连接 → 列目录 → 下载 → NSWorkspace 打开 →
-/// 本地修改 → FSEvents 触发自动上传 → 远程读回验证 → 冲突），结果写到 stdout 与日志文件。
+/// 在 App 进程中验证连接、下载、FSEvents 自动上传和冲突处理，结果写到 stdout 和 stderr。
 enum SelfTest {
     /// 自检专用临时工作区（finish 时清理），避免污染真实用户工作区。
     /// 符号链接（/var→/private/var）由 WorkspaceWatcher 在监听侧归一化，这里无需处理。
@@ -54,7 +53,7 @@ enum SelfTest {
             name: "selftest", endpoint: "https://demo.r2.cloudflarestorage.com", region: "auto", accessKeyID: "k", pathStyle: true
         )
         log("connect: \(connection.name) workspace=\(tempWorkspace.path)")
-        await MainActor.run { state.connect(to: connection) }
+        await MainActor.run { state.connect(to: connection, persistSelection: false) }
 
         // 1. 列 Bucket + 根目录
         try await waitUntil { await MainActor.run { !state.buckets.isEmpty } }
@@ -68,18 +67,13 @@ enum SelfTest {
         log("root: folders=\(folders) objects=\(objectKeys)")
         guard objects.contains(where: { $0.key == "config.yaml" }) else { throw SelfTestError.assertion("根目录缺少 config.yaml") }
 
-        // 2. 双击 → 下载 + NSWorkspace 打开
+        // 2. 走编辑器和 Quick Look 共用的下载入口。
         let entry = objects.first { $0.key == "config.yaml" }!
-        log("openInEditor: \(entry.key)")
-        await MainActor.run { Task { await state.openInEditor(entry) } }
-        let state2 = state
-        try await waitUntil {
-            let tracked = await MainActor.run { state2.syncStates["app-config/config.yaml"] }
-            return tracked == .synced
+        guard let localURL = await state.prepareLocalCopy(of: entry) else {
+            throw SelfTestError.assertion("无法准备本地副本")
         }
-        let localURL = state.workspace.localURL(bucket: "app-config", key: "config.yaml")
         guard FileManager.default.fileExists(atPath: localURL.path) else { throw SelfTestError.assertion("本地缓存未落盘") }
-        log("downloaded + opened via NSWorkspace: \(localURL.path)")
+        log("downloaded: \(localURL.path)")
 
         // 3. 模拟编辑器 ⌘S：修改本地文件 → FSEvents → 自动上传
         let original = try String(contentsOf: localURL, encoding: .utf8)
@@ -103,7 +97,7 @@ enum SelfTest {
         // 静默期：等待 FSEvents 迟到事件 / 防抖尾全部落定
         try await Task.sleep(for: .seconds(2))
 
-        // 4. 冲突：远程被他人修改 → 本地再改 → 引擎应发现 preconditionFailed 并弹冲突（handler 默认保留本地）
+        // 4. 依次处理两个同时等待选择的冲突。
         if let mock = service as? MockS3Service {
             _ = try await mock.simulateRemoteModify(bucket: "app-config", key: "config.yaml")
         }
@@ -112,13 +106,51 @@ enum SelfTest {
         try (current + "\n# \(conflictMarker)\n").write(to: localURL, atomically: true, encoding: .utf8)
         log("conflict edit written, waiting engine…")
         try await waitUntil {
-            let status = await MainActor.run { state2.syncStates["app-config/config.yaml"] }
-            if case .conflict = status { return true }
-            if case .failed = status { return true }
-            return false
+            await state.conflictDialog?.file.key == entry.key
         }
-        let status = await MainActor.run { state2.syncStates["app-config/config.yaml"] }
-        log("conflict detected, status=\(String(describing: status))")
+        guard let firstID = await state.conflictDialog?.id,
+              let second = objects.first(where: { $0.key == "config.json" }),
+              let secondURL = await state.prepareLocalCopy(of: second) else {
+            throw SelfTestError.assertion("无法准备并发冲突")
+        }
+        if let mock = service as? MockS3Service {
+            _ = try await mock.simulateRemoteModify(bucket: "app-config", key: second.key)
+        }
+        try "second conflicting edit".write(to: secondURL, atomically: true, encoding: .utf8)
+        try await waitUntil {
+            await state.statusPublic(bucket: "app-config", key: second.key) == .conflict
+        }
+        try await MainActor.run {
+            guard state.conflictDialog?.id == firstID else {
+                throw SelfTestError.assertion("第二个冲突覆盖了第一个")
+            }
+            state.resolveConflict(.keepLocalOnly, id: firstID)
+            state.conflictDialogDidDismiss()
+        }
+        try await waitUntil {
+            await state.conflictDialog?.file.key == second.key
+        }
+        try await MainActor.run {
+            guard let secondID = state.conflictDialog?.id else {
+                throw SelfTestError.assertion("第二个冲突未显示")
+            }
+            state.resolveConflict(.overwriteRemote, id: firstID)
+            guard state.conflictDialog?.id == secondID else {
+                throw SelfTestError.assertion("过期操作影响了第二个冲突")
+            }
+            state.resolveConflict(.reloadRemote, id: secondID)
+            state.conflictDialogDidDismiss()
+        }
+        try await waitUntil {
+            let firstStatus = await state.statusPublic(bucket: "app-config", key: entry.key)
+            let secondStatus = await state.statusPublic(bucket: "app-config", key: second.key)
+            return firstStatus == .failed("已保留本地副本（未上传）") && secondStatus == .synced
+        }
+        guard try String(contentsOf: localURL, encoding: .utf8).contains(conflictMarker),
+              try String(contentsOf: secondURL, encoding: .utf8).contains("[模拟] 远程在") else {
+            throw SelfTestError.assertion("冲突选择未应用到对应文件")
+        }
+        log("concurrent conflicts resolved in order")
 
         // 静默期后确认远程始终没有被冲突版本覆盖
         try await Task.sleep(for: .seconds(2))
@@ -127,6 +159,7 @@ enum SelfTest {
             throw SelfTestError.assertion("冲突时本地版本不应被自动覆盖")
         }
         log("remote not overwritten by conflict edit ✓")
+        await state.shutdown()
     }
 }
 

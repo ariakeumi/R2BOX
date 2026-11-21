@@ -14,6 +14,7 @@ public actor Debouncer {
         task = Task {
             try? await Task.sleep(for: delay)
             guard !Task.isCancelled else { return }
+            task = nil
             await action()
         }
     }

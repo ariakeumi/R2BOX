@@ -13,8 +13,13 @@ for arg in "$@"; do
   esac
 done
 
-echo "==> swift build -c $CONFIG"
-swift build -c "$CONFIG"
+# 显式记录链接 SDK，供 macOS 启用对应版本的窗口和工具栏样式。
+MIN_MACOS_VERSION="14.0"
+SDK_PATH=$(xcrun --sdk macosx --show-sdk-path)
+SDK_VERSION=$(xcrun --sdk macosx --show-sdk-version)
+echo "==> swift build -c $CONFIG (macOS SDK $SDK_VERSION)"
+swift build -c "$CONFIG" --sdk "$SDK_PATH" \
+  -Xlinker -platform_version -Xlinker macos -Xlinker "$MIN_MACOS_VERSION" -Xlinker "$SDK_VERSION"
 
 BIN=".build/$CONFIG/R2BOXApp"
 APP="build/R2BOX.app"
@@ -23,7 +28,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/R2BOX"
 [ -f Resources/AppIcon.icns ] && cp Resources/AppIcon.icns "$APP/Contents/Resources/"
 
-cat > "$APP/Contents/Info.plist" << 'PLIST'
+cat > "$APP/Contents/Info.plist" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -37,7 +42,7 @@ cat > "$APP/Contents/Info.plist" << 'PLIST'
     <key>CFBundleShortVersionString</key><string>0.1.0</string>
     <key>CFBundleVersion</key>           <string>1</string>
     <key>CFBundleInfoDictionaryVersion</key> <string>6.0</string>
-    <key>LSMinimumSystemVersion</key>    <string>14.0</string>
+    <key>LSMinimumSystemVersion</key>    <string>$MIN_MACOS_VERSION</string>
     <key>NSPrincipalClass</key>          <string>NSApplication</string>
     <key>NSHighResolutionCapable</key>   <true/>
     <key>NSHumanReadableCopyright</key>  <string>Copyright © 2026. MIT License.</string>
